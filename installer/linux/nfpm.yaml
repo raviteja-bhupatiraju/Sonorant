@@ -1,0 +1,73 @@
+# .deb and .rpm package definition for nfpm (https://nfpm.goreleaser.com), used by
+# installer/build-linux.sh, which fills in VERSION and STAGE (the staged files).
+name: sonorant
+arch: amd64
+platform: linux
+version: ${VERSION}
+section: utils
+priority: optional
+maintainer: Ravi Teja Bhupatiraju
+license: MIT
+description: |
+  System-tray text to speech and dictation.
+  Select text in any application and press a hotkey to hear it read aloud (Kokoro-82M), or
+  dictate into the focused application (Cactus Whistle, NVIDIA Parakeet / Canary; GPU accelerated
+  through Vulkan). Models download on first use into the shared Hugging Face cache.
+
+contents:
+  # The program with its libraries, ONNX Runtime and espeak-ng data (it finds them next to itself).
+  - src: ${STAGE}/usr/lib/sonorant
+    dst: /usr/lib/sonorant
+    type: tree
+  - src: /usr/lib/sonorant/sonorant
+    dst: /usr/bin/sonorant
+    type: symlink
+  - src: ${STAGE}/usr/share/applications/org.sonorant.Sonorant.desktop
+    dst: /usr/share/applications/org.sonorant.Sonorant.desktop
+  - src: ${STAGE}/usr/share/icons/hicolor/256x256/apps/org.sonorant.Sonorant.png
+    dst: /usr/share/icons/hicolor/256x256/apps/org.sonorant.Sonorant.png
+  # The license, where each distribution keeps it.
+  - src: ${STAGE}/usr/share/licenses/sonorant/LICENSE
+    dst: /usr/share/doc/sonorant/copyright
+    packager: deb
+  - src: ${STAGE}/usr/share/licenses/sonorant/LICENSE
+    dst: /usr/share/licenses/sonorant/LICENSE
+    type: license
+    packager: rpm
+
+# Needed at run time: ALSA (audio), and for the windows Wayland, xkbcommon and EGL (loaded on demand).
+# The X11 libraries are for the settings window on X11 desktops (loaded on demand). Vulkan is optional (GPU speech recognition; the CPU is used without it), the portals provide hotkeys
+# and typing on Wayland, and wtype types text on wlroots compositors without the RemoteDesktop portal.
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.36)
+      - libstdc++6
+      - libasound2 | libasound2t64
+      - libwayland-client0
+      - libxkbcommon0
+      - libegl1
+    recommends:
+      - libvulkan1
+      - libx11-6
+      - libxkbcommon-x11-0
+      - libxcursor1
+      - libxi6
+      - xdg-desktop-portal
+    suggests:
+      - wtype
+  rpm:
+    depends:
+      - alsa-lib
+      - libwayland-client
+      - libxkbcommon
+      - libglvnd-egl
+    recommends:
+      - vulkan-loader
+      - libX11
+      - libxkbcommon-x11
+      - libXcursor
+      - libXi
+      - xdg-desktop-portal
+    suggests:
+      - wtype

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Sonorant
+GenericName=Text to speech and dictation
+Comment=Read selected text aloud and dictate with hotkeys
+Exec=sonorant --settings
+Icon=org.sonorant.Sonorant
+Terminal=false
+Categories=Utility;Accessibility;
+Keywords=speech;tts;dictation;voice;read aloud;
+StartupNotify=false

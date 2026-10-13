@@ -1,0 +1,10 @@
+# Where scripts/setup-gpu-build.ps1 puts the Vulkan build tools (only used by the `gpu` feature on
+# Windows). On Linux the system's Vulkan headers and glslc are found instead (a missing folder here
+# is harmless).
+[env]
+VULKAN_SDK = { value = "vendor/vulkan-sdk", relative = true }
+CMAKE_PREFIX_PATH = { value = "vendor/vulkan-sdk/prefix", relative = true }
+# Use transcribe.cpp's built-in decoder maths rather than a system BLAS: the same on every platform,
+# no BLAS needed at run time, and it avoids a Linux detection bug that links a Fortran-only libblas
+# lacking the cblas functions (undefined symbol cblas_sgemm at start-up).
+TRANSCRIBE_CMAKE_ARGS = "-DTRANSCRIBE_USE_SYSTEM_BLAS=OFF"

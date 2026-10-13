@@ -1,0 +1,92 @@
+[package]
+name = "sonorant"
+version = "0.1.0"
+edition = "2021"
+authors = ["Ravi Teja Bhupatiraju"]
+license = "MIT"
+description = "System-tray hotkey text-to-speech and dictation (Kokoro, Cactus Whistle, Parakeet, Canary) for Windows and Wayland"
+
+[features]
+default = ["gpu"]
+# GPU acceleration for speech recognition (Vulkan, via transcribe.cpp's loadable backend modules).
+# Building it needs a Vulkan SDK (scripts/setup-gpu-build.ps1 on Windows; the system's on Linux).
+# Without this feature the engine is linked statically and runs on the CPU only.
+gpu = ["transcribe-cpp/vulkan", "transcribe-cpp/dynamic-backends"]
+
+[dependencies]
+# UI
+imgui = "0.12"
+imgui-winit-support = "0.13"
+imgui-glow-renderer = "0.13"
+raw-window-handle = "0.6"
+
+# TTS
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "load-dynamic", "api-27"] }
+espeak-rs = "0.2"
+cpal = "0.18"
+libloading = "0.8"
+transcribe-cpp = { version = "0.3.1", default-features = false }
+
+# Plumbing
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+parking_lot = "0.12"
+hound = "3.5"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+dirs = "6"
+log = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+arboard = "3"
+# Downloads use the Windows TLS stack (SChannel).
+ureq = { version = "3", default-features = false, features = ["native-tls"] }
+glutin = { version = "0.32", default-features = false, features = ["wgl"] }
+glutin-winit = { version = "0.5", default-features = false, features = ["wgl"] }
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+tray-icon = "0.26"
+global-hotkey = "0.8"
+winreg = "0.55"
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Diagnostics_Debug",
+] }
+
+# Wayland: hotkeys, key injection and the theme come from XDG desktop portals, the tray from
+# StatusNotifierItem, the indicator from wlr-layer-shell (desktop notifications where it is missing).
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard = { version = "3", features = ["wayland-data-control"] }
+# Downloads use rustls with built-in root certificates: no dependency on the system's OpenSSL version.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+glutin = { version = "0.32", default-features = false, features = ["egl", "wayland", "x11", "glx"] }
+glutin-winit = { version = "0.5", default-features = false, features = ["egl", "wayland", "x11", "glx"] }
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen", "wayland-csd-adwaita", "x11"] }
+ashpd = { version = "0.13", default-features = false, features = ["tokio", "global_shortcuts", "remote_desktop", "screencast", "settings"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+ksni = { version = "0.3", features = ["blocking"] }
+notify-rust = { version = "4", default-features = false, features = ["z"] }
+smithay-client-toolkit = { version = "0.21", default-features = false }
+ab_glyph = "0.2"
+# X11 desktops (Mint MATE, Xfce, i3...): key grabs, key injection through XTest, the indicator window.
+x11rb = { version = "0.13", default-features = false, features = ["xtest", "xkb", "shape", "randr"] }
+fontdb = "0.24"
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

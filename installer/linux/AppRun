@@ -1,0 +1,5 @@
+#!/bin/sh
+# AppImage entry point: start Sonorant from inside the mounted image. Its libraries, ONNX Runtime and
+# espeak-ng-data sit next to the binary, where it looks for them.
+here="$(dirname "$(readlink -f "$0")")"
+exec "$here/usr/lib/sonorant/sonorant" "$@"

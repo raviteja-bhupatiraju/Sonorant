@@ -1,0 +1,37 @@
+# Build output
+/target/
+
+# Installer output (published as GitHub release assets) and the Visual C++ runtime staged by build.ps1
+/installer/output/
+/installer/redist/
+
+# Large prebuilt binary; fetch with scripts/fetch-onnxruntime.ps1
+/vendor/onnxruntime.dll
+/vendor/libonnxruntime.so
+# Whistle engine; fetch with scripts/fetch-needle.ps1 / .sh
+/vendor/libneedle3.dll
+/vendor/libneedle3.so
+/vendor/vulkan-sdk/
+
+# Installer and package formats, wherever they end up
+*.exe
+*.msi
+*.deb
+*.rpm
+*.AppImage
+
+# Local artefacts
+*.wav
+*.log
+*.part
+.claude/
+graphify-out/
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
