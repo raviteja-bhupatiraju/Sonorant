@@ -20,13 +20,46 @@ use parking_lot::{Mutex, RwLock};
 
 use config::Config;
 
-struct Logger {
-    file: Mutex<Option<std::fs::File>>,
+/// The log file is rotated to `sonorant.log.old` once it grows past this size.
+const LOG_LIMIT: u64 = 512 * 1024;
+
+struct LogFile {
+    path: std::path::PathBuf,
+    file: Option<std::fs::File>,
+    len: u64,
+    /// Only the running instance rotates; a second process (`--cmd`, `--say`) just appends.
+    rotate: bool,
 }
+
+impl LogFile {
+    fn open(path: &std::path::Path) -> Option<std::fs::File> {
+        std::fs::OpenOptions::new().create(true).append(true).open(path).ok()
+    }
+
+    fn write(&mut self, line: &str) {
+        if self.rotate && self.len > LOG_LIMIT {
+            self.file = None; // closed before renaming (Windows)
+            let _ = std::fs::rename(&self.path, self.path.with_extension("log.old"));
+            self.file = Self::open(&self.path);
+            self.len = 0;
+        }
+        if let Some(f) = self.file.as_mut() {
+            if f.write_all(line.as_bytes()).is_ok() {
+                self.len += line.len() as u64;
+            }
+        }
+    }
+}
+
+struct Logger {
+    file: Mutex<Option<LogFile>>,
+}
+
+static LOGGER: Logger = Logger { file: Mutex::new(None) };
 
 impl log::Log for Logger {
     fn enabled(&self, m: &log::Metadata) -> bool {
-        m.level() <= log::Level::Info || m.target().starts_with("sonorant")
+        m.level() <= log::Level::Info
     }
 
     fn log(&self, r: &log::Record) {
@@ -36,7 +69,7 @@ impl log::Log for Logger {
         let line = format!("[{:>5}] {}\n", r.level(), r.args());
         eprint!("{line}");
         if let Some(f) = self.file.lock().as_mut() {
-            let _ = f.write_all(line.as_bytes());
+            f.write(&line);
         }
     }
 
@@ -46,14 +79,35 @@ impl log::Log for Logger {
 fn init_logging() {
     let dir = config::data_dir();
     let _ = std::fs::create_dir_all(&dir);
-    let log_path = dir.join("sonorant.log");
-    // Keep the log from growing forever.
-    if std::fs::metadata(&log_path).map(|m| m.len() > 512 * 1024).unwrap_or(false) {
-        let _ = std::fs::remove_file(&log_path);
+    let path = dir.join("sonorant.log");
+    let file = LogFile::open(&path);
+    let len = file.as_ref().and_then(|f| f.metadata().ok()).map_or(0, |m| m.len());
+    *LOGGER.file.lock() = Some(LogFile { path, file, len, rotate: false });
+    let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Info));
+}
+
+/// Keep the log from growing forever (called once this process is known to be the running instance).
+fn enable_log_rotation() {
+    if let Some(f) = LOGGER.file.lock().as_mut() {
+        f.rotate = true;
     }
-    let file = std::fs::OpenOptions::new().create(true).append(true).open(log_path).ok();
-    let logger: &'static Logger = Box::leak(Box::new(Logger { file: Mutex::new(file) }));
-    let _ = log::set_logger(logger).map(|()| log::set_max_level(log::LevelFilter::Info));
+}
+
+/// Wait until a worker reports ready via `ready`. Give up if it gets neither there nor any further
+/// with its download for a while, so a worker that died cannot hang the command forever.
+fn wait_ready(mut ready: impl FnMut() -> anyhow::Result<bool>, download: &Mutex<models::Progress>) -> anyhow::Result<()> {
+    const STALL: Duration = Duration::from_secs(300);
+    let (mut since, mut done) = (Instant::now(), download.lock().done);
+    while !ready()? {
+        let now_done = download.lock().done;
+        if now_done != done {
+            (since, done) = (Instant::now(), now_done);
+        } else if since.elapsed() > STALL {
+            anyhow::bail!("the model did not get ready in {} s", STALL.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
 }
 
 /// `sonorant --say "text" [--voice ID] [--speed X] [--wav FILE] [--no-stream] [--mute]`
@@ -80,6 +134,7 @@ fn run_cli(args: &[String]) -> anyhow::Result<()> {
             _ => {}
         }
     }
+    let cfg = cfg.sanitized();
     anyhow::ensure!(!text.is_empty(), "usage: sonorant --say \"text\" [--voice ID] [--speed X] [--wav FILE] [--no-stream] [--mute]");
 
     let cfg = Arc::new(RwLock::new(cfg));
@@ -90,14 +145,14 @@ fn run_cli(args: &[String]) -> anyhow::Result<()> {
     let audio = audio::AudioHandle::spawn(device, volume);
     let tts = tts::Tts::spawn(cfg.clone(), audio, Arc::new(|| {}));
     let t_load = Instant::now();
-    loop {
-        match tts.status.lock().state.clone() {
-            tts::EngineState::Ready => break,
+    wait_ready(
+        || match tts.status.lock().state.clone() {
+            tts::EngineState::Ready => Ok(true),
             tts::EngineState::Error(e) => anyhow::bail!("engine failed: {e}"),
-            _ => {}
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+            _ => Ok(false),
+        },
+        &tts.download,
+    )?;
     println!("model ready after {:.2}s", t_load.elapsed().as_secs_f32());
 
     for run in 1..=2 {
@@ -173,13 +228,14 @@ fn run_transcribe_cli(args: &[String]) -> anyhow::Result<()> {
     );
     let t = Instant::now();
     stt.preload();
-    loop {
-        match stt.status.lock().state.clone() {
-            stt::SttState::Ready => break,
+    wait_ready(
+        || match stt.status.lock().state.clone() {
+            stt::SttState::Ready => Ok(true),
             stt::SttState::Error(e) => anyhow::bail!("{e}"),
-            _ => std::thread::sleep(Duration::from_millis(20)),
-        }
-    }
+            _ => Ok(false),
+        },
+        &stt.download,
+    )?;
     println!("model ready after {:.2}s", t.elapsed().as_secs_f32());
     if live {
         let (tx, audio) = std::sync::mpsc::channel();
@@ -256,13 +312,19 @@ fn main() {
     init_logging();
 
     // Only one instance may own the hotkeys and the tray icon.
+    #[cfg(windows)]
+    if forward.is_some_and(|c| c != platform::Command::Settings) {
+        log::warn!("on Windows only --settings can be sent to the running Sonorant");
+    }
+    let forwarded = forward.is_some();
     let Ok(instance) = platform::Instance::claim(forward) else {
-        log::warn!("Sonorant is already running");
+        log::info!("{}", if forwarded { "sent to the running Sonorant" } else { "Sonorant is already running" });
         return;
     };
     if cmd.is_some() {
         return log::warn!("Sonorant is not running");
     }
+    enable_log_rotation();
 
     if let Err(e) = run_gui(instance, has("--settings")) {
         log::error!("fatal: {e:#}");

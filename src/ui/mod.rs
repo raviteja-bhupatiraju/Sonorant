@@ -5,20 +5,20 @@ use std::num::NonZeroU32;
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
-use glutin::config::ConfigTemplateBuilder;
+use glutin::config::{Config as GlConfig, ConfigTemplateBuilder, GlConfig as _};
 use glutin::context::{ContextAttributesBuilder, NotCurrentGlContext, PossiblyCurrentContext};
-use glutin::display::{GetGlDisplay, GlDisplay};
+use glutin::display::{Display, DisplayApiPreference, GetGlDisplay, GlDisplay};
 use glutin::surface::{GlSurface, Surface, SurfaceAttributesBuilder, SwapInterval, WindowSurface};
 use imgui::{Condition, FontConfig, FontSource, StyleColor, Ui, WindowFlags};
 use imgui_glow_renderer::glow::{self, HasContext};
 use imgui_glow_renderer::AutoRenderer;
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
-use raw_window_handle::HasWindowHandle;
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Event, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{Window, WindowAttributes, WindowId};
 
 pub mod icon;
 pub mod overlay;
@@ -37,10 +37,10 @@ pub struct Snapshot {
     pub last: Option<Metrics>,
     pub download: Progress,
     /// Registration errors for [speak, stop, dictate] hotkeys.
-    pub hotkey_errors: [Option<String>; 3],
+    pub hotkey_errors: [Option<String>; 4],
     pub stt: SttStatus,
     pub stt_download: Progress,
-    pub history: Vec<Entry>,
+    pub history: std::sync::Arc<Vec<Entry>>,
 }
 
 pub enum Action {
@@ -67,6 +67,7 @@ enum Recording {
     Speak,
     Stop,
     Dictate,
+    DictateSubmit,
 }
 
 struct UiState {
@@ -104,11 +105,7 @@ impl SettingsWindow {
             .with_resizable(false)
             .with_enabled_buttons(winit::window::WindowButtons::CLOSE)
             .with_window_icon(icon);
-        let (window, gl_config) = glutin_winit::DisplayBuilder::new()
-            .with_window_attributes(Some(attrs))
-            .build(event_loop, ConfigTemplateBuilder::new(), |mut configs| configs.next().unwrap())
-            .map_err(|e| anyhow!("create window: {e}"))?;
-        let window = window.ok_or_else(|| anyhow!("no window created"))?;
+        let (window, gl_config) = create_gl_window(event_loop, attrs)?;
         let handle = window.window_handle()?.as_raw();
 
         let context_attribs = ContextAttributesBuilder::new().build(Some(handle));
@@ -198,8 +195,44 @@ impl SettingsWindow {
             }
             _ => {}
         }
+        let rescaled = matches!(event, WindowEvent::ScaleFactorChanged { .. });
         let wrapped = Event::<()>::WindowEvent { window_id: self.window.id(), event };
         self.platform.handle_event(self.imgui.io_mut(), &self.window, &wrapped);
+        if rescaled {
+            self.rebuild_font();
+        }
+    }
+
+    /// Re-rasterize the font for the new DPI scale (e.g. the window moved to another monitor)
+    /// and re-upload the atlas into the renderer's existing font texture.
+    fn rebuild_font(&mut self) {
+        let scale = self.platform.hidpi_factor() as f32;
+        let tex_id = self.imgui.fonts().tex_id;
+        self.imgui.fonts().clear();
+        install_font(&mut self.imgui, 15.0 * scale);
+        self.imgui.io_mut().font_global_scale = 1.0 / scale;
+        let Some(texture) = self.renderer.renderer().font_atlas_texture else { return };
+        let fonts = self.imgui.fonts();
+        let atlas = fonts.build_rgba32_texture();
+        unsafe {
+            // Same format as imgui_glow_renderer's own atlas upload.
+            let gl = self.renderer.gl_context();
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::SRGB8_ALPHA8 as _,
+                atlas.width as _,
+                atlas.height as _,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                Some(atlas.data),
+            );
+            gl.bind_texture(glow::TEXTURE_2D, None);
+        }
+        fonts.tex_id = tex_id;
+        self.window.request_redraw();
     }
 
     fn record_key(&mut self, code: KeyCode) {
@@ -227,6 +260,7 @@ impl SettingsWindow {
             Recording::Speak => self.state.draft.hotkey = spec,
             Recording::Stop => self.state.draft.stop_hotkey = Some(spec),
             Recording::Dictate => self.state.draft.stt_hotkey = spec,
+            Recording::DictateSubmit => self.state.draft.stt_submit_hotkey = Some(spec),
         }
         self.state.recording = None;
     }
@@ -253,6 +287,37 @@ impl SettingsWindow {
         }
         let _ = self.surface.swap_buffers(&self.context);
         action
+    }
+}
+
+/// Create the window and choose its GL config, like `glutin_winit::DisplayBuilder` (whose config
+/// picker cannot fail, so an empty config list would panic), preferring an sRGB-capable config
+/// to match the sRGB surface requested in `SettingsWindow::new`.
+fn create_gl_window(event_loop: &ActiveEventLoop, attrs: WindowAttributes) -> Result<(Window, GlConfig)> {
+    let display_handle = event_loop.display_handle()?.as_raw();
+    let pick = |configs: Box<dyn Iterator<Item = GlConfig> + '_>| {
+        configs
+            .reduce(|a, b| if b.srgb_capable() && !a.srgb_capable() { b } else { a })
+            .ok_or_else(|| anyhow!("no suitable OpenGL configuration found"))
+    };
+    #[cfg(windows)]
+    {
+        // WGL needs the window to choose a config.
+        let window = event_loop.create_window(attrs).map_err(|e| anyhow!("create window: {e}"))?;
+        let handle = window.window_handle()?.as_raw();
+        let display = unsafe { Display::new(display_handle, DisplayApiPreference::Wgl(Some(handle)))? };
+        let template = ConfigTemplateBuilder::new().compatible_with_native_window(handle).build();
+        let config = pick(unsafe { display.find_configs(template)? })?;
+        Ok((window, config))
+    }
+    #[cfg(not(windows))]
+    {
+        // Same preference as glutin_winit's default: GLX on X11, EGL otherwise (Wayland).
+        let preference = DisplayApiPreference::GlxThenEgl(Box::new(winit::platform::x11::register_xlib_error_hook));
+        let display = unsafe { Display::new(display_handle, preference)? };
+        let config = pick(unsafe { display.find_configs(ConfigTemplateBuilder::new().build())? })?;
+        let window = glutin_winit::finalize_window(event_loop, attrs, &config).map_err(|e| anyhow!("create window: {e}"))?;
+        Ok((window, config))
     }
 }
 
@@ -601,11 +666,10 @@ fn tab_dictation(ui: &Ui, st: &mut UiState, snap: &Snapshot, action: &mut Action
 
     ui.dummy([0.0, 4.0]);
     label(ui, "Model");
-    let old_model = st.draft.stt_model;
     combo_row(ui, "##sttmodel", &mut st.draft.stt_model, &SttModel::ALL, |m| m.label());
-    // Keep the language valid for the chosen model.
+    // Keep the language valid for the chosen model (and keep it if the new model supports it too).
     let langs = st.draft.stt_model.languages();
-    if old_model != st.draft.stt_model || !langs.iter().any(|(c, _)| *c == st.draft.stt_language) {
+    if !langs.iter().any(|(c, _)| *c == st.draft.stt_language) {
         st.draft.stt_language = langs[0].0.to_owned();
     }
     if langs.len() > 1 {
@@ -629,6 +693,16 @@ fn tab_dictation(ui: &Ui, st: &mut UiState, snap: &Snapshot, action: &mut Action
     label(ui, "Hotkey");
     hotkey_button(ui, st, Recording::Dictate, st.draft.stt_hotkey.label());
     hotkey_error(ui, &snap.hotkey_errors[2]);
+    label(ui, "Finish and send");
+    let submit = st.draft.stt_submit_hotkey.as_ref().map_or_else(|| "Not set".into(), HotkeySpec::label);
+    hotkey_button(ui, st, Recording::DictateSubmit, submit);
+    ui.same_line();
+    if ui.button("Clear##submit") {
+        st.draft.stt_submit_hotkey = None;
+        st.recording = None;
+    }
+    hotkey_error(ui, &snap.hotkey_errors[3]);
+    dim_wrapped(ui, "Ends the recording like the hotkey above, but adds no space after the text and presses Enter, to send a chat message. Starts a recording when none is running; pressed twice quickly it only presses Enter.");
     label(ui, "Mode");
     combo_row(ui, "##sttmode", &mut st.draft.stt_mode, &SttMode::ALL, |m| m.label());
     label(ui, "Microphone");
@@ -700,6 +774,7 @@ fn tab_history(ui: &Ui, st: &mut UiState, snap: &Snapshot, action: &mut Action) 
     if ui.button_with_size("Clear", [86.0, 0.0]) {
         *action = Action::ClearHistory;
     }
+    dim_wrapped(ui, "Transcripts are stored unencrypted in Sonorant's data folder. Set 0 to keep none.");
     ui.dummy([0.0, 2.0]);
     if snap.history.is_empty() {
         dim_wrapped(ui, "Nothing here yet. Dictated text appears here so you can copy it again.");
@@ -815,7 +890,7 @@ mod tests {
             hotkey_errors: [None, None, None],
             stt: SttStatus { state: SttState::Ready, last: None, device: String::new(), runs_since_load: 0 },
             stt_download: Progress::default(),
-            history: Vec::new(),
+            history: Default::default(),
         }
     }
 

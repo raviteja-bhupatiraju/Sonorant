@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-pub use input::{clipboard_text, copy_text, insert, prepare_insert, selected_text};
+pub use input::{clipboard_text, copy_text, insert, prepare_insert, selected_text, send_enter};
 pub use overlay::Overlay;
 pub use tray::Tray;
 
@@ -33,6 +33,11 @@ use super::{Command, CommandSink};
 /// The primary selection keeps the last selected text even after it is deselected, so a second
 /// hotkey press on the same text cannot mean "nothing selected": it stops speech instead.
 pub const SELECTION_PERSISTS: bool = true;
+
+/// Whether the selection cannot be read right now (never on Linux: no keystroke is simulated).
+pub fn selection_blocked() -> bool {
+    false
+}
 
 /// Paste shortcut used by `PasteMethod::Auto`. Wayland does not reveal the focused application,
 /// so terminals (Ctrl+Shift+V) can only be detected on X11.
@@ -147,23 +152,56 @@ pub(crate) fn block_on<T>(limit: Duration, fut: impl Future<Output = T>) -> Opti
 /// Terminals already have a console.
 pub fn attach_console() {}
 
-fn socket_path() -> PathBuf {
-    dirs::runtime_dir().unwrap_or_else(std::env::temp_dir).join("sonorant.sock")
+fn runtime_path(name: &str) -> PathBuf {
+    dirs::runtime_dir().unwrap_or_else(std::env::temp_dir).join(name)
 }
 
-/// Single instance through a Unix socket in `$XDG_RUNTIME_DIR`, which also carries `sonorant --cmd`
-/// commands to the running instance.
+fn socket_path() -> PathBuf {
+    runtime_path("sonorant.sock")
+}
+
+/// Single instance through a lock file and a Unix socket in `$XDG_RUNTIME_DIR`; the socket also
+/// carries `sonorant --cmd` commands to the running instance.
 pub struct Instance {
     listener: Option<UnixListener>,
+    /// Holds the instance lock (released by the kernel when the process ends, even after a crash).
+    _lock: Option<std::fs::File>,
 }
 
 impl Instance {
     /// Claim the single instance; `Err` if Sonorant is already running, after passing `forward` to it.
     pub fn claim(forward: Option<Command>) -> Result<Self, ()> {
         let path = socket_path();
-        if let Ok(mut running) = UnixStream::connect(&path) {
-            if let Some(cmd) = forward {
-                let _ = writeln!(running, "{}", cmd.name());
+        // The lock decides who runs, so two instances starting together cannot both bind the socket
+        // (or remove the other one's fresh socket as a leftover).
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(runtime_path("sonorant.lock"))
+            .inspect_err(|e| log::warn!("instance lock unavailable: {e}"))
+            .ok();
+        let owner = match &lock {
+            Some(file) => match file.try_lock() {
+                Ok(()) => true,
+                Err(std::fs::TryLockError::WouldBlock) => false,
+                Err(std::fs::TryLockError::Error(e)) => {
+                    log::warn!("instance lock unavailable: {e}");
+                    UnixStream::connect(&path).is_err()
+                }
+            },
+            None => UnixStream::connect(&path).is_err(),
+        };
+        if !owner {
+            // The running instance may still be starting up: give it a moment to open its socket.
+            for _ in 0..20 {
+                if let Ok(mut running) = UnixStream::connect(&path) {
+                    if let Some(cmd) = forward {
+                        let _ = writeln!(running, "{}", cmd.name());
+                    }
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
             }
             return Err(());
         }
@@ -171,7 +209,10 @@ impl Instance {
         let listener = UnixListener::bind(&path)
             .inspect_err(|e| log::warn!("command socket {} unavailable: {e}", path.display()))
             .ok();
-        Ok(Self { listener })
+        // Register with the portal frontend before anything uses a portal (every portal user awaits
+        // `register_app`, which waits for this attempt), without holding up the start.
+        runtime().spawn(register_app());
+        Ok(Self { listener, _lock: lock })
     }
 
     /// Deliver commands from other processes (`sonorant --cmd NAME`) to `sink`.
@@ -181,12 +222,16 @@ impl Instance {
             .name("commands".into())
             .spawn(move || {
                 for stream in listener.incoming().flatten() {
-                    for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                        match Command::parse(line.trim()) {
-                            Some(cmd) => sink(cmd),
-                            None => log::warn!("unknown command {line:?}"),
+                    // One thread per client: one that never closes must not block the others.
+                    let sink = sink.clone();
+                    std::thread::spawn(move || {
+                        for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                            match Command::parse(line.trim()) {
+                                Some(cmd) => sink(cmd),
+                                None => log::warn!("unknown command {line:?}"),
+                            }
                         }
-                    }
+                    });
                 }
             })
             .expect("spawn command thread");
@@ -215,7 +260,7 @@ const GENERATED: &str = "X-Sonorant-Generated=true";
 
 /// A `.desktop` entry that starts Sonorant with `args`; `hidden` keeps it out of application menus.
 fn desktop_entry(args: &str, hidden: bool) -> Result<String> {
-    let exec = format!("\"{}\" {args}", launcher()?.display());
+    let exec = format!("{} {args}", exec_arg(&launcher()?.to_string_lossy()));
     Ok(format!(
         "[Desktop Entry]
 Type=Application
@@ -230,6 +275,25 @@ NoDisplay={hidden}
 ",
         exec.trim_end()
     ))
+}
+
+/// `arg` as a quoted argument of a `.desktop` entry's `Exec` key (Desktop Entry spec): `"`, `` ` ``,
+/// `$` and `\` are backslash-escaped inside the quotes and `%` (field codes) is doubled; then the
+/// value's own string escaping doubles every backslash once more.
+fn exec_arg(arg: &str) -> String {
+    let mut quoted = String::from("\"");
+    for c in arg.chars() {
+        match c {
+            '"' | '`' | '$' | '\\' => {
+                quoted.push('\\');
+                quoted.push(c);
+            }
+            '%' => quoted.push_str("%%"),
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted.replace('\\', "\\\\")
 }
 
 /// Make sure a `<APP_ID>.desktop` entry exists, which portals need to identify Sonorant (and which
@@ -265,19 +329,29 @@ fn install_desktop_entry() {
     }
 }
 
-/// Install the desktop entry and register Sonorant's id with the portal frontend. Runs once.
+/// Install the desktop entry and register Sonorant's id with the portal frontend. Must be awaited
+/// before any portal call (the registration has to come first on the connection). Runs once; a
+/// registration that timed out is tried again by the next caller.
 pub(crate) async fn register_app() {
     static DONE: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
-    DONE.get_or_init(|| async {
-        install_desktop_entry();
-        let registered = async { ashpd::register_host_app(APP_ID.parse()?).await };
-        match tokio::time::timeout(Duration::from_secs(2), registered).await {
-            Ok(Err(e)) => log::debug!("portal app registration: {e}"), // older portals have no host registry
-            Err(_) => log::debug!("portal app registration timed out"),
-            Ok(Ok(())) => {}
-        }
-    })
-    .await;
+    let _ = DONE
+        .get_or_try_init(|| async {
+            install_desktop_entry();
+            let registered = async { ashpd::register_host_app(APP_ID.parse()?).await };
+            match tokio::time::timeout(Duration::from_secs(2), registered).await {
+                Ok(Ok(())) => Ok(()),
+                // An answer, if a negative one: older portals have no host registry.
+                Ok(Err(e)) => {
+                    log::debug!("portal app registration: {e}");
+                    Ok(())
+                }
+                Err(_) => {
+                    log::debug!("portal app registration timed out");
+                    Err(())
+                }
+            }
+        })
+        .await;
 }
 
 pub fn set_autostart(enable: bool) -> Result<()> {
@@ -294,7 +368,10 @@ pub fn set_autostart(enable: bool) -> Result<()> {
 /// The desktop's light / dark preference (Settings portal); dark when unknown.
 pub fn prefers_light_theme() -> bool {
     use ashpd::desktop::settings::{ColorScheme, Settings};
-    let scheme = block_on(Duration::from_millis(800), async { Settings::new().await?.color_scheme().await });
+    let scheme = block_on(Duration::from_millis(800), async {
+        register_app().await;
+        Settings::new().await?.color_scheme().await
+    });
     matches!(scheme, Some(Ok(ColorScheme::PreferLight)))
 }
 
@@ -317,4 +394,16 @@ pub(crate) fn sans_font() -> Option<(Vec<u8>, u32)> {
 /// The UI font for the settings dialog (only plain font files: imgui reads the first face).
 pub fn ui_font() -> Option<Vec<u8>> {
     sans_font().filter(|(_, index)| *index == 0).map(|(data, _)| data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exec_arguments_are_escaped() {
+        assert_eq!(exec_arg("/opt/Sonorant.AppImage"), r#""/opt/Sonorant.AppImage""#);
+        // `\` and `"` get the quoting escape, then the string escape doubles the backslashes.
+        assert_eq!(exec_arg(r#"/a b/100%/$x`y"z\w"#), r#""/a b/100%%/\\$x\\`y\\"z\\\\w""#);
+    }
 }

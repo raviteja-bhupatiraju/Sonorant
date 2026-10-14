@@ -1,6 +1,7 @@
 //! Windows: Win32 hotkeys, SendInput, a GDI layered window for the indicator, the registry.
 
 mod capture;
+mod clipboard;
 mod hotkeys;
 mod overlay;
 mod paste;
@@ -12,7 +13,7 @@ use anyhow::Result;
 pub use capture::{clipboard_text, copy_text, open_clipboard, selected_text};
 pub use hotkeys::Hotkeys;
 pub use overlay::Overlay;
-pub use paste::insert;
+pub use paste::{insert, send_enter};
 pub use tray::Tray;
 
 use super::Command;
@@ -20,6 +21,12 @@ use super::Command;
 /// Whether the selection stays readable after the user deselects it (Linux's primary selection).
 /// Windows reads it with a copy shortcut, so an empty selection means "nothing selected".
 pub const SELECTION_PERSISTS: bool = false;
+
+/// Whether the selection cannot be read right now: Windows silently drops the copy shortcut sent
+/// to a window that runs as administrator when Sonorant does not.
+pub fn selection_blocked() -> bool {
+    win::foreground_is_elevated_above_us()
+}
 
 /// Nothing to prepare: SendInput needs no permission.
 pub fn prepare_insert() {}
@@ -36,7 +43,7 @@ pub fn hotkey_note() -> Option<&'static str> {
 
 /// Paste shortcut used by `PasteMethod::Auto`.
 pub fn auto_paste_label() -> &'static str {
-    "Automatic (Ctrl+V, Shift+Insert in terminals)"
+    "Automatic (Ctrl+V, Shift+Insert or Ctrl+Shift+V in terminals)"
 }
 
 /// With the GUI subsystem there is no console; attach to the parent's so CLI modes can print.
@@ -48,28 +55,59 @@ pub fn attach_console() {
 }
 
 /// Only one instance may own the hotkeys and the tray icon. Held for the life of the process.
-pub struct Instance(#[allow(dead_code)] windows_sys::Win32::Foundation::HANDLE);
+pub struct Instance {
+    #[allow(dead_code)]
+    mutex: windows_sys::Win32::Foundation::HANDLE,
+    /// Signalled by a second `sonorant --settings`, which asks this instance to open its window.
+    /// (Windows has no command channel like Linux's socket: this one event is all it supports.)
+    open_settings: windows_sys::Win32::Foundation::HANDLE,
+}
+
+const EVENT_NAME: &str = r"Local\Sonorant.OpenSettings";
 
 impl Instance {
-    /// Claim the single instance; `Err` if Sonorant is already running. Windows has no command
-    /// channel to the running instance, so `forward` is ignored.
+    /// Claim the single instance; `Err` if Sonorant is already running (a `Settings` command is
+    /// handed to it first). Other commands cannot be forwarded on Windows.
     pub fn claim(forward: Option<Command>) -> Result<Self, ()> {
-        use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
-        use windows_sys::Win32::System::Threading::CreateMutexW;
-        let _ = forward;
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+        use windows_sys::Win32::System::Threading::{CreateEventW, CreateMutexW, OpenEventW, SetEvent, EVENT_MODIFY_STATE};
         let name = win::wide(r"Local\Sonorant.SingleInstance");
+        let event_name = win::wide(EVENT_NAME);
         unsafe {
-            let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
-            if handle.is_null() || GetLastError() == ERROR_ALREADY_EXISTS {
-                Err(())
-            } else {
-                Ok(Self(handle))
+            let mutex = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+            if mutex.is_null() {
+                return Err(());
             }
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                if forward == Some(Command::Settings) {
+                    let event = OpenEventW(EVENT_MODIFY_STATE, 0, event_name.as_ptr());
+                    if !event.is_null() {
+                        SetEvent(event);
+                        CloseHandle(event);
+                    }
+                }
+                CloseHandle(mutex);
+                return Err(());
+            }
+            let open_settings = CreateEventW(std::ptr::null(), 0, 0, event_name.as_ptr()); // auto-reset
+            Ok(Self { mutex, open_settings })
         }
     }
 
-    /// Deliver commands from other processes (`sonorant --cmd`); not available on Windows.
-    pub fn listen(&self, _sink: super::CommandSink) {}
+    /// Deliver the "open the settings" request of a second launch.
+    pub fn listen(&self, sink: super::CommandSink) {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+        if self.open_settings.is_null() {
+            return;
+        }
+        let event = self.open_settings as usize; // the handle lives as long as the process
+        std::thread::spawn(move || {
+            while unsafe { WaitForSingleObject(event as _, INFINITE) } == WAIT_OBJECT_0 {
+                sink(Command::Settings);
+            }
+        });
+    }
 }
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";

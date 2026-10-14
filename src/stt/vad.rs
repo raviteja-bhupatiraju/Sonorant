@@ -25,9 +25,12 @@ pub struct Vad {
 }
 
 impl Vad {
+    /// Load the model. A file ONNX Runtime cannot read is removed from the cache, so a retry
+    /// downloads it again.
     pub fn load(path: &Path) -> Result<Self> {
         crate::tts::engine::init_runtime()?;
-        let session = (|| Session::builder()?.with_intra_threads(1)?.with_inter_threads(1)?.commit_from_file(path))()?;
+        let mut builder = (|| -> ort::Result<_> { Ok(Session::builder()?.with_intra_threads(1)?.with_inter_threads(1)?) })()?;
+        let session = builder.commit_from_file(path).inspect_err(|_| crate::models::hub::evict_if_damaged(path))?;
         Ok(Self { session })
     }
 

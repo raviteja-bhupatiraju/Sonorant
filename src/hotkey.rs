@@ -5,7 +5,8 @@
 use serde::{Deserialize, Serialize};
 use winit::keyboard::KeyCode;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HotkeySpec {
     pub ctrl: bool,
     pub alt: bool,
@@ -112,14 +113,15 @@ impl HotkeySpec {
 
     /// Build a spec from the modifier state and the pressed physical key.
     /// Returns `None` for bare modifier presses, keys the platform cannot bind, and combinations
-    /// that would hijack normal typing (no modifier and not a function key).
+    /// that would hijack normal typing (no Ctrl/Alt/Super and not a function key: Shift alone
+    /// only types capitals and symbols).
     pub fn from_winit(ctrl: bool, alt: bool, shift: bool, meta: bool, key: KeyCode) -> Option<Self> {
         let name = format!("{key:?}");
         if Self::is_modifier(key) || !key_supported(&name) {
             return None;
         }
         let is_fkey = name.len() >= 2 && name.starts_with('F') && name[1..].chars().all(|c| c.is_ascii_digit());
-        if !(ctrl || alt || shift || meta) && !is_fkey && key != KeyCode::Escape {
+        if !(ctrl || alt || meta || is_fkey) && key != KeyCode::Escape {
             return None;
         }
         Some(Self { ctrl, alt, shift, meta, key: name })
@@ -263,6 +265,24 @@ mod tests {
         assert!(HotkeySpec::from_winit(false, false, false, false, KeyCode::KeyA).is_none());
         assert!(HotkeySpec::from_winit(false, false, false, false, KeyCode::F2).is_some());
         assert!(HotkeySpec::from_winit(true, false, false, false, KeyCode::ControlLeft).is_none());
+    }
+
+    #[test]
+    fn shift_alone_does_not_make_a_typing_key_bindable() {
+        assert!(HotkeySpec::from_winit(false, false, true, false, KeyCode::KeyA).is_none());
+        assert!(HotkeySpec::from_winit(false, false, true, false, KeyCode::Digit1).is_none());
+        assert!(HotkeySpec::from_winit(false, false, true, false, KeyCode::Space).is_none());
+        let spec = HotkeySpec::from_winit(true, false, true, false, KeyCode::KeyA).expect("Ctrl+Shift+A");
+        assert!(spec.ctrl && spec.shift);
+        assert!(HotkeySpec::from_winit(false, true, false, false, KeyCode::KeyA).is_some());
+        assert!(HotkeySpec::from_winit(false, false, false, true, KeyCode::KeyA).is_some());
+        assert!(HotkeySpec::from_winit(false, false, true, false, KeyCode::F5).is_some());
+    }
+
+    #[test]
+    fn missing_fields_take_defaults() {
+        let spec: HotkeySpec = serde_json::from_str(r#"{"ctrl":true,"key":"KeyS"}"#).expect("parse");
+        assert_eq!(spec, HotkeySpec::new(true, false, false, "KeyS"));
     }
 
     #[test]

@@ -31,6 +31,25 @@ pub enum UserEvent {
     Stt(SttEvent),
     /// Hide the overlay if it still shows the notice with this serial number.
     HideOverlay(u64),
+    /// Show "Transcribing..." if the overlay is still as it was with this serial number.
+    ShowWorking(u64),
+    /// Show a short message from a worker thread.
+    Notice(String),
+    /// The microphone for the recording with this number was (or could not be) opened.
+    RecorderStarted(u64, Result<(), String>),
+    /// The recording with this number was stopped; here is its audio and whether it was cut short.
+    Recorded(u64, Vec<f32>, bool),
+    /// The microphone disappeared while recording.
+    MicLost,
+}
+
+/// Press Enter in the focused application, off the UI thread (it waits for modifier keys to be released).
+fn send_enter() {
+    std::thread::spawn(|| {
+        if let Err(e) = platform::send_enter() {
+            log::warn!("could not press Enter: {e:#}");
+        }
+    });
 }
 
 const SAMPLE_SENTENCE: &str = "Hello! This is how I sound. Press your hotkey on any selected text, and I will read it aloud.";
@@ -38,8 +57,12 @@ const SAMPLE_SENTENCE: &str = "Hello! This is how I sound. Press your hotkey on 
 #[derive(Clone, Copy, PartialEq)]
 enum Dictation {
     Idle,
-    Recording { since: Instant },
-    Processing,
+    /// Recording number `seq`; the device may still be opening.
+    Recording { since: Instant, seq: u64 },
+    /// Recording number `seq` was stopped and its audio is on its way from the recorder thread.
+    Stopping { seq: u64 },
+    /// Waiting for the transcription with this id (see `Stt::transcribe`).
+    Processing { id: u64 },
 }
 
 pub struct App {
@@ -58,12 +81,19 @@ pub struct App {
     last_spoken: Arc<parking_lot::Mutex<String>>,
     last_hotkey: Instant,
     open_settings_on_start: bool,
+    /// The settings window needs a redraw at the next wake-up (status may have changed).
+    redraw_due: bool,
     // ---- speech recognition ----
     proxy: EventLoopProxy<UserEvent>,
     stt: Stt,
     recorder: Recorder,
     overlay: Option<Overlay>,
     dictation: Dictation,
+    dictation_seq: u64,
+    /// The recording in progress ends with the "finish and send" key.
+    submit: bool,
+    /// When the "finish and send" key was last pressed (a quick second press just sends Enter).
+    last_submit_press: Instant,
     overlay_serial: u64,
 }
 
@@ -80,11 +110,14 @@ impl App {
         let saved = Config::load();
         let cfg = Arc::new(RwLock::new(saved.clone()));
 
+        // Reading the history file would otherwise happen on the UI thread, when the window opens.
+        std::thread::spawn(|| drop(crate::history::entries()));
         let audio = AudioHandle::spawn(saved.output_device.clone(), saved.volume);
         let stt = Stt::spawn(cfg.clone(), Arc::new(forward(&proxy, UserEvent::Stt)));
         if saved.stt_enabled {
             stt.preload();
         }
+        let proxy_for_recorder = proxy.clone();
         let status_changed = forward(&proxy, |()| UserEvent::StatusChanged);
         let tts = Tts::spawn(cfg.clone(), audio.clone(), Arc::new(move || status_changed(())));
 
@@ -101,11 +134,18 @@ impl App {
             last_spoken: Arc::default(),
             last_hotkey: Instant::now() - Duration::from_secs(10),
             open_settings_on_start,
+            redraw_due: false,
             proxy,
             stt,
-            recorder: Recorder::spawn(),
+            recorder: Recorder::spawn({
+                let lost = forward(&proxy_for_recorder, |()| UserEvent::MicLost);
+                Arc::new(move || lost(()))
+            }),
             overlay: None,
             dictation: Dictation::Idle,
+            dictation_seq: 0,
+            submit: false,
+            last_submit_press: Instant::now() - Duration::from_secs(10),
             overlay_serial: 0,
         }
     }
@@ -130,15 +170,20 @@ impl App {
                 }
             }
             Command::SpeakClipboard => {
-                if let Some(text) = platform::clipboard_text() {
-                    self.tts.speak(text, Instant::now());
-                }
+                // The clipboard can be locked for a moment by another application: not on this thread.
+                let tts = self.tts.clone();
+                std::thread::spawn(move || {
+                    if let Some(text) = platform::clipboard_text() {
+                        tts.speak(text, Instant::now());
+                    }
+                });
             }
             Command::Stop => {
                 self.tts.stop();
                 self.cancel_dictation();
             }
             Command::Dictate(pressed) => self.on_dictation_key(pressed),
+            Command::DictateSubmit => self.on_dictation_submit_key(),
             Command::Cancel => self.cancel_dictation(),
             Command::Quit => event_loop.exit(),
         }
@@ -151,11 +196,25 @@ impl App {
         let tts = self.tts.clone();
         let capturing = self.capturing.clone();
         let last_spoken = self.last_spoken.clone();
+        let proxy = self.proxy.clone();
         let (restore, fallback) = {
             let c = self.cfg.read();
             (c.restore_clipboard, c.clipboard_fallback)
         };
         std::thread::spawn(move || {
+            // Clears the flag however this thread ends (even by a panic), so the hotkey keeps working.
+            struct Done(Arc<AtomicBool>);
+            impl Drop for Done {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                }
+            }
+            let _done = Done(capturing);
+            if platform::selection_blocked() {
+                log::warn!("the focused window runs as administrator: its selection cannot be read");
+                let _ = proxy.send_event(UserEvent::Notice("Cannot read the selection of an administrator window".into()));
+                return;
+            }
             match platform::selected_text(restore, fallback) {
                 // Pressed again on the same (still selected) text while it is being read: stop.
                 Some((text, _)) if platform::SELECTION_PERSISTS && tts.is_busy() && *last_spoken.lock() == text => {
@@ -174,7 +233,6 @@ impl App {
                     }
                 }
             }
-            capturing.store(false, Ordering::SeqCst);
         });
     }
 
@@ -184,7 +242,7 @@ impl App {
         let mode = self.cfg.read().stt_mode;
         match (mode, pressed, self.dictation) {
             (SttMode::PushToTalk, true, Dictation::Idle) => self.start_recording(),
-            (SttMode::PushToTalk, false, Dictation::Recording { since }) => {
+            (SttMode::PushToTalk, false, Dictation::Recording { since, .. }) => {
                 if since.elapsed() < Duration::from_millis(250) {
                     // An accidental tap: nothing worth transcribing.
                     self.cancel_dictation();
@@ -194,7 +252,34 @@ impl App {
             }
             (SttMode::Toggle, true, Dictation::Idle) => self.start_recording(),
             (SttMode::Toggle, true, Dictation::Recording { .. }) => self.finish_recording(),
+            (_, true, Dictation::Stopping { .. } | Dictation::Processing { .. }) => {
+                self.show_overlay(overlay::Kind::Working, "Transcribing...", Some("Still working on the last dictation"));
+            }
             _ => {}
+        }
+    }
+
+    /// The "finish and send" key. With no recording it starts one; while recording it ends it like
+    /// the dictation key, but the text is inserted without a trailing space and followed by Enter.
+    /// Pressed again quickly it only sends Enter (dropping the recording that the first press began),
+    /// so a message can be sent from the same two keys without reaching for the keyboard's Enter.
+    fn on_dictation_submit_key(&mut self) {
+        let quick = self.last_submit_press.elapsed() < Duration::from_millis(600);
+        self.last_submit_press = Instant::now();
+        match self.dictation {
+            Dictation::Idle if quick => send_enter(),
+            Dictation::Idle => self.start_recording(),
+            Dictation::Recording { .. } if quick => {
+                self.cancel_dictation();
+                send_enter();
+            }
+            Dictation::Recording { .. } => {
+                self.submit = true;
+                self.finish_recording();
+            }
+            Dictation::Stopping { .. } | Dictation::Processing { .. } => {
+                self.show_overlay(overlay::Kind::Working, "Transcribing...", Some("Still working on the last dictation"));
+            }
         }
     }
 
@@ -241,11 +326,14 @@ impl App {
     }
 
     fn start_recording(&mut self) {
+        self.submit = false;
         let state = self.stt.status.lock().state.clone();
         match state {
             SttState::Disabled => return,
             SttState::Error(_) => {
-                self.notice("Speech model unavailable - see Settings", 3);
+                // Try loading it again (a download may have failed while offline); this press is lost.
+                self.stt.preload();
+                self.notice("Speech model unavailable - retrying, see Settings", 3);
                 return;
             }
             _ => {}
@@ -256,15 +344,17 @@ impl App {
             let c = self.cfg.read();
             (c.input_device.clone(), c.show_overlay && c.live_preview, c.paste_method != PasteMethod::ClipboardOnly)
         };
-        let audio = match self.recorder.start(&device) {
-            Ok(audio) => audio,
-            Err(e) => {
-                log::error!("could not start recording: {e}");
-                self.notice("Microphone unavailable", 3);
-                return;
-            }
-        };
-        self.dictation = Dictation::Recording { since: Instant::now() };
+        // Opening the device can take a while: the result arrives as an event.
+        self.dictation_seq += 1;
+        let seq = self.dictation_seq;
+        let proxy = self.proxy.clone();
+        let audio = self.recorder.start(
+            &device,
+            Box::new(move |result| {
+                let _ = proxy.send_event(UserEvent::RecorderStarted(seq, result));
+            }),
+        );
+        self.dictation = Dictation::Recording { since: Instant::now(), seq };
         // Load (or download) the model while the user is still speaking.
         self.stt.preload();
         if live {
@@ -283,7 +373,19 @@ impl App {
     }
 
     fn finish_recording(&mut self) {
-        let pcm = self.recorder.stop();
+        let Dictation::Recording { seq, .. } = self.dictation else { return };
+        self.dictation = Dictation::Stopping { seq };
+        self.hide_overlay(); // at once: the transcription is usually done in a blink
+        let proxy = self.proxy.clone();
+        self.recorder.stop(Box::new(move |pcm, truncated| {
+            let _ = proxy.send_event(UserEvent::Recorded(seq, pcm, truncated));
+        }));
+    }
+
+    fn on_recorded(&mut self, seq: u64, pcm: Vec<f32>, truncated: bool) {
+        if self.dictation != (Dictation::Stopping { seq }) {
+            return; // cancelled in the meantime
+        }
         if pcm.len() < STT_RATE as usize / 4 {
             self.dictation = Dictation::Idle;
             self.set_esc(false);
@@ -291,24 +393,50 @@ impl App {
             return;
         }
         log::info!("recorded {:.1}s", pcm.len() as f32 / STT_RATE as f32);
-        self.dictation = Dictation::Processing;
         // The first transcription after a model load can be slow (GPU pipelines are prepared on first use).
         let first = self.stt.status.lock().runs_since_load == 0;
-        let hint = first.then_some("The first transcription after loading can be slow");
-        self.show_overlay(overlay::Kind::Working, "Transcribing...", hint);
-        self.stt.transcribe(pcm);
+        let downloading = self.stt.status.lock().state == SttState::Downloading;
+        let hint = if truncated {
+            Some("The recording reached the 10 minute limit and was cut")
+        } else if downloading {
+            Some("Downloading the speech model...")
+        } else {
+            first.then_some("The first transcription after loading can be slow")
+        };
+        if hint.is_some() {
+            self.show_overlay(overlay::Kind::Working, "Transcribing...", hint);
+        } else {
+            // Only a slow transcription is worth showing: a fast one would just flash the overlay.
+            let (serial, proxy) = (self.overlay_serial, self.proxy.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(700));
+                let _ = proxy.send_event(UserEvent::ShowWorking(serial));
+            });
+        }
+        let submit = std::mem::take(&mut self.submit);
+        self.dictation = Dictation::Processing { id: self.stt.transcribe(pcm, submit) };
     }
 
     fn cancel_dictation(&mut self) {
         if self.dictation == Dictation::Idle {
             return;
         }
-        let _ = self.recorder.stop();
+        self.submit = false;
+        self.recorder.stop(Box::new(|_, _| {})); // the audio is not wanted
         self.stt.cancel();
         self.dictation = Dictation::Idle;
         self.set_esc(false);
         self.hide_overlay();
         log::info!("dictation cancelled");
+    }
+
+    fn on_recorder_started(&mut self, seq: u64, result: Result<(), String>) {
+        let current = matches!(self.dictation, Dictation::Recording { seq: s, .. } if s == seq);
+        if let (true, Err(e)) = (current, result) {
+            log::error!("could not start recording: {e}");
+            self.cancel_dictation();
+            self.notice("Microphone unavailable", 3);
+        }
     }
 
     fn on_stt_event(&mut self, event: SttEvent) {
@@ -319,9 +447,9 @@ impl App {
                     self.show_overlay(overlay::Kind::Recording, &text, None);
                 }
             }
-            SttEvent::Finished(outcome) => {
-                if self.dictation != Dictation::Processing {
-                    return; // cancelled in the meantime
+            SttEvent::Finished(id, outcome) => {
+                if self.dictation != (Dictation::Processing { id }) {
+                    return; // cancelled in the meantime (this may be the end of an older dictation)
                 }
                 self.dictation = Dictation::Idle;
                 self.set_esc(false);
@@ -396,11 +524,11 @@ impl App {
         match action {
             Action::None => {}
             Action::Preview(draft) => {
-                // Use the draft voice/speed/volume for the preview only.
-                let Config { voice, speed, volume, streaming, .. } = draft;
-                *self.cfg.write() = Config { voice, speed, volume, streaming, ..self.saved.clone() };
-                self.audio.set_volume(volume);
-                self.tts.speak(SAMPLE_SENTENCE.to_string(), Instant::now());
+                // Use the draft voice and speed for this request only, so the hotkeys keep the saved
+                // settings. Volume is global to the output: Cancel restores it.
+                self.audio.set_volume(draft.volume);
+                let overrides = crate::tts::Overrides { voice: Some(draft.voice), speed: Some(draft.speed) };
+                self.tts.speak_with(SAMPLE_SENTENCE.to_string(), Instant::now(), overrides);
             }
             Action::Apply(c) => self.apply(c),
             Action::Save(c) => {
@@ -418,8 +546,12 @@ impl App {
                 self.stt.unload();
                 self.stt.preload();
             }
-            Action::ClearHistory => crate::history::clear(),
-            Action::Copy(text) => platform::copy_text(text),
+            Action::ClearHistory => {
+                std::thread::spawn(crate::history::clear); // writes the file
+            }
+            Action::Copy(text) => {
+                std::thread::spawn(move || platform::copy_text(text)); // the clipboard may be busy
+            }
         }
     }
 
@@ -430,7 +562,7 @@ impl App {
         if new.output_device != old.output_device {
             self.audio.set_device(new.output_device.clone());
         }
-        let hotkeys = |c: &Config| (c.hotkey.clone(), c.stop_hotkey.clone(), c.stt_hotkey.clone(), c.stt_enabled);
+        let hotkeys = |c: &Config| (c.hotkey.clone(), c.stop_hotkey.clone(), c.stt_hotkey.clone(), c.stt_submit_hotkey.clone(), c.stt_enabled);
         if hotkeys(&new) != hotkeys(&old) {
             self.register_hotkeys();
         }
@@ -445,7 +577,8 @@ impl App {
         if engine_changed || (new.stt_enabled, new.stt_model) != (old.stt_enabled, old.stt_model) {
             self.stt.preload(); // loads when enabled, unloads when disabled
         }
-        crate::history::trim_to(new.history_limit);
+        let limit = new.history_limit;
+        std::thread::spawn(move || crate::history::trim_to(limit)); // writes the file
         if new.start_with_windows != old.start_with_windows {
             if let Err(e) = platform::set_autostart(new.start_with_windows) {
                 log::warn!("could not update autostart: {e:#}");
@@ -454,15 +587,24 @@ impl App {
         if new.model != old.model || new.threads != old.threads {
             self.tts.reload();
         }
-        if let Err(e) = new.save() {
-            log::error!("could not save config: {e:#}");
-        }
+        // Writing (and flushing) the file must not stall the event loop.
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = new.save() {
+                log::error!("could not save config: {e:#}");
+                let _ = proxy.send_event(UserEvent::Notice("Could not save the settings - see the log".into()));
+            }
+        });
         self.refresh_tray();
     }
 }
 
 impl ApplicationHandler<UserEvent> for App {
-    fn new_events(&mut self, _: &ActiveEventLoop, _: StartCause) {}
+    fn new_events(&mut self, _: &ActiveEventLoop, cause: StartCause) {
+        if matches!(cause, StartCause::ResumeTimeReached { .. }) {
+            self.redraw_due = true;
+        }
+    }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.tray.is_some() {
@@ -482,7 +624,7 @@ impl ApplicationHandler<UserEvent> for App {
             Err(e) => log::error!("could not set up global hotkeys: {e:#}"),
         }
         // Test hook: speak this text once the voice model is ready (used to test the stop key).
-        if let Ok(text) = std::env::var("SONORANT_TEST_SPEAK") {
+        if let Some(text) = std::env::var("SONORANT_TEST_SPEAK").ok().filter(|_| cfg!(feature = "test-hooks")) {
             let tts = self.tts.clone();
             std::thread::spawn(move || {
                 while tts.status.lock().state != EngineState::Ready {
@@ -500,10 +642,25 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        self.redraw_due = true; // status shown in the settings window may have changed
         match event {
             UserEvent::Command(cmd) => self.on_command(event_loop, cmd),
             UserEvent::StatusChanged => self.refresh_tray(),
             UserEvent::Stt(e) => self.on_stt_event(e),
+            UserEvent::Notice(text) => self.notice(&text, 3),
+            UserEvent::RecorderStarted(seq, result) => self.on_recorder_started(seq, result),
+            UserEvent::Recorded(seq, pcm, truncated) => self.on_recorded(seq, pcm, truncated),
+            UserEvent::MicLost => {
+                if matches!(self.dictation, Dictation::Recording { .. }) {
+                    self.cancel_dictation();
+                    self.notice("Microphone disconnected", 3);
+                }
+            }
+            UserEvent::ShowWorking(serial) => {
+                if serial == self.overlay_serial && matches!(self.dictation, Dictation::Processing { .. }) {
+                    self.show_overlay(overlay::Kind::Working, "Transcribing...", None);
+                }
+            }
             UserEvent::HideOverlay(serial) => {
                 if serial == self.overlay_serial {
                     self.hide_overlay();
@@ -524,6 +681,7 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         win.handle_event(event);
+        self.redraw_due = true;
         if win.wants_close() {
             self.handle_action(Action::Cancel);
         }
@@ -538,16 +696,19 @@ impl ApplicationHandler<UserEvent> for App {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(250)))
             }
             Some(w) => {
-                // Live status needs periodic redraws, but ~30 fps is plenty; input events
-                // wake the loop immediately, so the dialog still feels responsive.
+                // Live status needs periodic redraws, but ~30 fps is plenty: redraw when the timer
+                // fires or after input / status events (which wake the loop at once), not on every pass.
+                if std::mem::take(&mut self.redraw_due) {
+                    w.request_redraw();
+                }
                 event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(33)));
-                w.request_redraw();
             }
             None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 
     fn exiting(&mut self, _: &ActiveEventLoop) {
+        models::hub::cancel_downloads();
         self.cancel_dictation();
         self.stt.shutdown();
         self.tts.shutdown();

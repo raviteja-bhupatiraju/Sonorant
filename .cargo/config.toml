@@ -3,7 +3,10 @@
 # is harmless).
 [env]
 VULKAN_SDK = { value = "vendor/vulkan-sdk", relative = true }
-CMAKE_PREFIX_PATH = { value = "vendor/vulkan-sdk/prefix", relative = true }
+# force: without it a CMAKE_PREFIX_PATH already set in the environment (by another SDK, Conda, vcpkg...)
+# would win and CMake would not find the SPIRV-Headers package. Cargo cannot prepend to a variable;
+# if you need extra prefixes, add them to this value.
+CMAKE_PREFIX_PATH = { value = "vendor/vulkan-sdk/prefix", relative = true, force = true }
 # Use transcribe.cpp's built-in decoder maths rather than a system BLAS: the same on every platform,
 # no BLAS needed at run time, and it avoids a Linux detection bug that links a Fortran-only libblas
 # lacking the cblas functions (undefined symbol cblas_sgemm at start-up).

@@ -40,24 +40,24 @@ pub fn fit(text: &str, max_h: i32, keep_end: bool, mut measure: impl FnMut(&str)
         return (text.to_owned(), w, h);
     }
     let chars: Vec<char> = text.chars().collect();
-    // Keep `n` characters, preferring a word boundary unless that would throw away too much.
+    // Keep `n` characters, preferring a word boundary unless that would throw away too much
+    // (at most `MAX_DROP` characters, counted in chars, not bytes). The kept text only ever grows
+    // with `n` (each candidate extends the previous one), so the binary search below is valid.
+    const MAX_DROP: usize = 24;
     let candidate = |n: usize| -> String {
         let is_cut = |c: char| c.is_whitespace() || ",;:-".contains(c);
         if keep_end {
-            let s: String = chars[chars.len() - n..].iter().collect();
-            let s = match s.find(char::is_whitespace) {
-                Some(pos) if pos < 24 => &s[pos..],
-                _ => &s,
-            };
-            format!("\u{2026}{}", s.trim_start_matches(is_cut))
-        } else {
-            let mut s: String = chars[..n].iter().collect();
-            if let Some(pos) = s.rfind(char::is_whitespace) {
-                if s.len() - pos < 24 {
-                    s.truncate(pos);
-                }
+            let mut s = &chars[chars.len() - n..];
+            if let Some(pos) = s.iter().position(|c| c.is_whitespace()).filter(|&p| p < MAX_DROP) {
+                s = &s[pos..];
             }
-            format!("{}\u{2026}", s.trim_end_matches(is_cut))
+            format!("\u{2026}{}", String::from_iter(s).trim_start_matches(is_cut))
+        } else {
+            let mut s = &chars[..n];
+            if let Some(pos) = s.iter().rposition(|c| c.is_whitespace()).filter(|&p| n - p < MAX_DROP) {
+                s = &s[..pos];
+            }
+            format!("{}\u{2026}", String::from_iter(s).trim_end_matches(is_cut))
         }
     };
     let (mut lo, mut hi) = (0usize, chars.len());
@@ -144,5 +144,17 @@ mod tests {
         assert!(h <= 20 && head.starts_with("one") && head.ends_with('\u{2026}'), "{head}");
         let (tail, _, h) = fit(text, 20, true, measure);
         assert!(h <= 20 && tail.ends_with("ten") && tail.starts_with('\u{2026}'), "{tail}");
+    }
+
+    #[test]
+    fn fit_counts_characters_not_bytes() {
+        // Multi-byte text: word-boundary limits must count characters.
+        let measure = |t: &str| (100, (t.chars().count() as i32 + 9) / 10 * 10);
+        let text = "ééééé ééééé ééééé ééééé ééééé ééééé ééééé";
+        let (head, _, h) = fit(text, 20, false, measure);
+        assert!(h <= 20 && head.chars().count() >= 15 && !head.contains("  "), "{head}");
+        assert!(head.trim_end_matches('\u{2026}').split(' ').all(|w| w == "ééééé"), "{head}");
+        let (tail, _, h) = fit(text, 20, true, measure);
+        assert!(h <= 20 && tail.trim_start_matches('\u{2026}').split(' ').all(|w| w == "ééééé"), "{tail}");
     }
 }

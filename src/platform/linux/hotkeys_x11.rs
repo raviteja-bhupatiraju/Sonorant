@@ -22,8 +22,22 @@ enum Act {
     Speak,
     Stop,
     Dictate,
+    DictateSubmit,
     /// Esc during a dictation.
     Cancel,
+}
+
+impl Act {
+    /// The slot of the settings dialog's error list for this hotkey (Esc to cancel has none).
+    fn slot(self) -> Option<usize> {
+        match self {
+            Act::Speak => Some(0),
+            Act::Stop => Some(1),
+            Act::Dictate => Some(2),
+            Act::DictateSubmit => Some(3),
+            Act::Cancel => None,
+        }
+    }
 }
 
 struct Bind {
@@ -45,7 +59,8 @@ pub struct X11Hotkeys {
     conn: Arc<RustConnection>,
     root: u32,
     state: Arc<Mutex<State>>,
-    errors: HotkeyErrors,
+    /// Shared with the event thread, which grabs the keys again when the keyboard layout changes.
+    errors: Arc<Mutex<HotkeyErrors>>,
     /// Esc (plain, and with the dictation hotkey's modifiers), claimed only while dictating, to cancel.
     esc: Vec<(u32, u16)>,
     /// A "stop" hotkey that is plain Esc is claimed only while something is speaking or being dictated.
@@ -75,11 +90,23 @@ fn ungrab(conn: &RustConnection, root: u32, keycode: u8, mods: u16, combos: usiz
 }
 
 impl State {
-    fn grab_all(&mut self, conn: &RustConnection, root: u32) {
+    /// Grab every bound key again (after a keyboard mapping change), reporting into `errors` the
+    /// ones that are no longer on the keyboard or that another program holds.
+    fn grab_all(&mut self, conn: &RustConnection, root: u32, errors: &Mutex<HotkeyErrors>) {
         for b in &mut self.binds {
             b.keycode = self.keymap.find(b.sym).map_or(0, |(k, _)| k);
-            if b.keycode != 0 && grab(conn, root, b.keycode, b.mods).is_err() {
+            let failed = match b.keycode {
+                0 => Some("is not on the keyboard (layout changed)"),
+                k => grab(conn, root, k, b.mods).is_err().then_some("is unavailable (already in use by another program?)"),
+            };
+            if failed.is_some() {
                 b.keycode = 0;
+            }
+            if let Some(slot) = b.act.slot() {
+                errors.lock()[slot] = failed.map(|why| format!("The {:?} hotkey {why}", b.act));
+            }
+            if let Some(why) = failed {
+                log::warn!("could not grab the {:?} hotkey again: it {why}", b.act);
             }
         }
     }
@@ -108,11 +135,14 @@ impl X11Hotkeys {
         let keymap = Keymap::load(&d.conn)?;
         let (conn, root) = (Arc::new(d.conn), d.root);
         let state = Arc::new(Mutex::new(State { binds: Vec::new(), keymap, held: HashMap::new() }));
+        let errors = Arc::new(Mutex::new(HotkeyErrors::default()));
         {
-            let (conn, state) = (conn.clone(), state.clone());
-            std::thread::Builder::new().name("x11-hotkeys".into()).spawn(move || event_loop(&conn, root, &state, &sink))?;
+            let (conn, state, errors) = (conn.clone(), state.clone(), errors.clone());
+            std::thread::Builder::new()
+                .name("x11-hotkeys".into())
+                .spawn(move || event_loop(&conn, root, &state, &errors, &sink))?;
         }
-        Ok(Self { conn, root, state, errors: Default::default(), esc: Vec::new(), transient_stop: None, transient_on: false })
+        Ok(Self { conn, root, state, errors, esc: Vec::new(), transient_stop: None, transient_on: false })
     }
 
     /// Grab `sym` + `mods` for `act`.
@@ -151,35 +181,40 @@ impl X11Hotkeys {
         self.esc.clear();
         self.transient_stop = None;
         self.transient_on = false;
-        self.errors = Default::default();
+        let mut errors = HotkeyErrors::default();
 
-        // Slots match `errors`: [speak, stop, dictate].
+        // Slots match `errors`: [speak, stop, dictate, dictate and send].
         let wanted = [
             Some((Act::Speak, &cfg.hotkey)),
             cfg.stop_hotkey.as_ref().map(|k| (Act::Stop, k)),
             cfg.stt_enabled.then_some((Act::Dictate, &cfg.stt_hotkey)),
+            cfg.stt_submit_hotkey.as_ref().filter(|_| cfg.stt_enabled).map(|k| (Act::DictateSubmit, k)),
         ];
         let mut used: Vec<&HotkeySpec> = Vec::new();
         for (slot, (act, spec)) in wanted.into_iter().enumerate().filter_map(|(i, w)| Some((i, w?))) {
             if used.contains(&spec) {
-                self.errors[slot] = Some(format!("{} is already used by another Sonorant shortcut", spec.label()));
+                errors[slot] = Some(format!("{} is already used by another Sonorant shortcut", spec.label()));
                 continue;
             }
             used.push(spec);
-            let Some(grab) = spec.x11_grab() else { continue };
+            let Some(grab) = spec.x11_grab() else {
+                errors[slot] = Some(format!("{} cannot be used as a hotkey on X11", spec.label()));
+                continue;
+            };
             if act == Act::Stop && spec.is_plain_escape() {
                 self.transient_stop = Some(grab); // claimed on demand, see `set_busy`
                 continue;
             }
             if let Err(e) = self.bind(grab, act) {
                 log::warn!("could not grab {}: {e}", spec.label());
-                self.errors[slot] = Some(format!("{} is unavailable (already in use by another program?)", spec.label()));
+                errors[slot] = Some(format!("{} is unavailable (already in use by another program?)", spec.label()));
             }
         }
+        *self.errors.lock() = errors;
     }
 
     pub fn errors(&self) -> HotkeyErrors {
-        self.errors.clone()
+        self.errors.lock().clone()
     }
 
     /// Claim Esc to cancel while a dictation is in progress (`dictate` is the dictation hotkey).
@@ -221,6 +256,7 @@ impl X11Hotkeys {
 fn command(act: Act, pressed: bool) -> Option<Command> {
     match act {
         Act::Dictate => Some(Command::Dictate(pressed)),
+        Act::DictateSubmit => pressed.then_some(Command::DictateSubmit),
         _ if !pressed => None,
         Act::Speak => Some(Command::Speak),
         Act::Stop => Some(Command::Stop),
@@ -228,7 +264,7 @@ fn command(act: Act, pressed: bool) -> Option<Command> {
     }
 }
 
-fn event_loop(conn: &RustConnection, root: u32, state: &Mutex<State>, sink: &CommandSink) {
+fn event_loop(conn: &RustConnection, root: u32, state: &Mutex<State>, errors: &Mutex<HotkeyErrors>, sink: &CommandSink) {
     loop {
         let event = match conn.wait_for_event() {
             Ok(e) => e,
@@ -271,7 +307,7 @@ fn event_loop(conn: &RustConnection, root: u32, state: &Mutex<State>, sink: &Com
                 if moved {
                     st.ungrab_all(conn, root);
                     st.keymap = map;
-                    st.grab_all(conn, root);
+                    st.grab_all(conn, root, errors);
                     st.held.clear();
                     let _ = conn.flush();
                 } else {
@@ -296,6 +332,7 @@ mod tests {
         if std::env::var_os("DISPLAY").is_none() || x11::connect().is_err() {
             return;
         }
+        let _server = x11::tests::SERVER.lock();
         let (tx, rx) = mpsc::channel();
         let sink: CommandSink = Arc::new(move |c| {
             let _ = tx.send(c);

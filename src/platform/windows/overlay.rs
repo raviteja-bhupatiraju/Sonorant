@@ -16,12 +16,14 @@ use windows_sys::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, DrawTextW, GdiFlush, GetDC, ReleaseDC,
     SelectObject, SetBkMode, SetTextColor, AC_SRC_ALPHA, AC_SRC_OVER,
     BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CLEARTYPE_QUALITY, DIB_RGB_COLORS, DT_CALCRECT, DT_LEFT,
-    DT_NOCLIP, DT_NOPREFIX, DT_SINGLELINE, DT_WORDBREAK, HDC, HFONT, TRANSPARENT,
+    DT_NOCLIP, DT_NOPREFIX, DT_SINGLELINE, DT_WORDBREAK, HDC, HFONT, TRANSPARENT, GetMonitorInfoW, MonitorFromWindow,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForSystem, MDT_EFFECTIVE_DPI};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, SetWindowPos, ShowWindow, SystemParametersInfoW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow, RegisterClassW, SetWindowPos, ShowWindow,
+    SystemParametersInfoW,
     UpdateLayeredWindow, HWND_TOPMOST, SPI_GETWORKAREA, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
     SW_SHOWNOACTIVATE, ULW_ALPHA, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_POPUP,
@@ -32,6 +34,25 @@ use crate::ui::overlay::{apply_alpha, draw_dot, fill_pill, fit, Kind, HINT_RGB, 
 
 fn rgb((r, g, b): (u8, u8, u8)) -> COLORREF {
     r as u32 | (g as u32) << 8 | (b as u32) << 16
+}
+
+/// Work area and DPI of the monitor with the focused window (where the user is looking), so the
+/// pill follows the user across monitors. Falls back to the primary monitor.
+unsafe fn work_area() -> (RECT, u32) {
+    let fg = GetForegroundWindow();
+    let monitor = MonitorFromWindow(fg, if fg.is_null() { MONITOR_DEFAULTTOPRIMARY } else { MONITOR_DEFAULTTONEAREST });
+    let mut info: MONITORINFO = std::mem::zeroed();
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    let (mut dpi_x, mut dpi_y) = (0u32, 0u32);
+    if !monitor.is_null() && GetMonitorInfoW(monitor, &mut info) != 0 {
+        if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) < 0 {
+            dpi_x = GetDpiForSystem();
+        }
+        return (info.rcWork, dpi_x);
+    }
+    let mut area: RECT = std::mem::zeroed();
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut area as *mut RECT as *mut _, 0);
+    (area, GetDpiForSystem())
 }
 
 unsafe fn font(px: f32, weight: i32) -> HFONT {
@@ -107,9 +128,8 @@ impl Overlay {
     /// Show `text` (and an optional small `hint` line under it), sizing the pill to fit.
     pub fn show(&self, kind: Kind, text: &str, hint: Option<&str>) {
         unsafe {
-            let scale = GetDpiForWindow(self.hwnd).max(96) as f32 / 96.0;
-            let mut area: RECT = std::mem::zeroed();
-            SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut area as *mut RECT as *mut _, 0);
+            let (area, dpi) = work_area();
+            let scale = dpi.max(96) as f32 / 96.0;
             let work_w = area.right - area.left;
 
             // ---- layout, in device pixels ----

@@ -275,16 +275,18 @@ impl LayerOverlay {
         }
     }
 
-    /// The scale and logical width of the (first) output.
-    fn output(&self) -> (i32, i32) {
-        let info = self.state.outputs.outputs().next().and_then(|o| self.state.outputs.info(&o));
+    /// The output the indicator goes on (the first one), with its scale and logical width.
+    fn output(&self) -> (Option<wl_output::WlOutput>, i32, i32) {
+        let output = self.state.outputs.outputs().next();
+        let info = output.as_ref().and_then(|o| self.state.outputs.info(o));
         let scale = info.as_ref().map_or(1, |i| i.scale_factor.max(1));
         let width = info.and_then(|i| i.logical_size).map_or(1920, |(w, _)| w);
-        (scale, width)
+        (output, scale, width)
     }
 
     fn show(&mut self, kind: Kind, text: &str, hint: Option<&str>) -> anyhow::Result<()> {
-        let (scale, logical_w) = self.output();
+        // The surface is placed on the output it is sized for (not wherever the compositor likes).
+        let (output, scale, logical_w) = self.output();
         let img = render(&self.text, kind, text, hint, scale as f32, logical_w * scale);
         let (lw, lh) = ((img.w / scale) as u32, (img.h / scale) as u32);
         let qh = self.queue.handle();
@@ -294,7 +296,7 @@ impl LayerOverlay {
             // Clicks go through to the application underneath.
             let region = Region::new(&self.state.compositor)?;
             surface.set_input_region(Some(region.wl_region()));
-            let layer = self.state.layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("sonorant-indicator"), None);
+            let layer = self.state.layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("sonorant-indicator"), output.as_ref());
             layer.set_anchor(Anchor::BOTTOM);
             layer.set_margin(0, 0, 28, 0);
             layer.set_keyboard_interactivity(KeyboardInteractivity::None);

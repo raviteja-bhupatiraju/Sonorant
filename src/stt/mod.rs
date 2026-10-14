@@ -3,14 +3,17 @@
 //! inserted text.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 
-use transcribe_cpp::{Backend, Feature, Model, ModelOptions, RunOptions, Session, SessionOptions, StreamOptions};
+use transcribe_cpp::{
+    Backend, Feature, Model, ModelOptions, ParakeetBufferedStreamOptions, RunOptions, Session, SessionOptions,
+    StreamExtension, StreamOptions,
+};
 
 pub mod recorder;
 pub mod vad;
@@ -68,7 +71,8 @@ pub enum SttEvent {
     StateChanged,
     /// The live transcript of the recording in progress.
     Partial(String),
-    Finished(Outcome),
+    /// The transcription with this id (as returned by `Stt::transcribe`) is done.
+    Finished(u64, Outcome),
 }
 
 pub type SttNotify = Arc<dyn Fn(SttEvent) + Send + Sync>;
@@ -79,7 +83,7 @@ enum Cmd {
     Unload,
     /// Transcribe a recording as it happens, reporting `SttEvent::Partial`s until it stops.
     Live(LiveAudio),
-    Transcribe { pcm: Vec<f32>, id: u64, reply: Option<Sender<Result<String, String>>> },
+    Transcribe { pcm: Vec<f32>, id: u64, submit: bool, reply: Option<Sender<Result<String, String>>> },
     Quit,
 }
 
@@ -113,7 +117,7 @@ impl Stt {
             notify,
             loaded: None,
             vad: None,
-            force_cpu: false,
+            force_cpu: None,
         };
         std::thread::Builder::new().name("stt".into()).spawn(move || worker.run()).expect("spawn stt thread");
         Self { tx, status, download, current }
@@ -128,9 +132,10 @@ impl Stt {
         let _ = self.tx.send(Cmd::Unload);
     }
 
-    fn send_transcribe(&self, pcm: Vec<f32>, reply: Option<Sender<Result<String, String>>>) {
+    fn send_transcribe(&self, pcm: Vec<f32>, submit: bool, reply: Option<Sender<Result<String, String>>>) -> u64 {
         let id = self.current.fetch_add(1, Ordering::SeqCst) + 1;
-        let _ = self.tx.send(Cmd::Transcribe { pcm, id, reply });
+        let _ = self.tx.send(Cmd::Transcribe { pcm, id, submit, reply });
+        id
     }
 
     /// Show a live transcript of the recording that `audio` delivers (preview only: the inserted
@@ -140,14 +145,16 @@ impl Stt {
     }
 
     /// Transcribe 16 kHz mono audio and insert the text.
-    pub fn transcribe(&self, pcm: Vec<f32>) {
-        self.send_transcribe(pcm, None);
+    /// Returns the id its `SttEvent::Finished` will carry.
+    /// With `submit` the text goes in without a trailing space and Enter is pressed after it.
+    pub fn transcribe(&self, pcm: Vec<f32>, submit: bool) -> u64 {
+        self.send_transcribe(pcm, submit, None)
     }
 
     /// Transcribe and return the text instead of inserting it (command-line testing).
     pub fn transcribe_to_text(&self, pcm: Vec<f32>) -> Result<String, String> {
         let (reply, rx) = mpsc::channel();
-        self.send_transcribe(pcm, Some(reply));
+        self.send_transcribe(pcm, false, Some(reply));
         rx.recv().unwrap_or_else(|e| Err(e.to_string()))
     }
 
@@ -235,14 +242,16 @@ fn load_transcribe(kind: SttModel, path: &std::path::Path, n_threads: i32, want_
         let model = Model::load_with(path, &ModelOptions { backend, ..Default::default() })?;
         let mut session = model.session_with(&SessionOptions { n_threads, ..Default::default() })?;
         let on_gpu = model.device().is_ok_and(|d| d.device_type != transcribe_cpp::DeviceType::Cpu);
-        // Warm up (kernel / shader setup, page-in of the weights) so the first real dictation is
-        // quick. On a GPU, pipelines are created per input size class the first time they are
+        // Warm up the GPU (shader setup) so the first real dictation is quick. On a GPU, pipelines are created per input size class the first time they are
         // used (seconds, once per machine; the driver caches them), so cover short, medium
         // and long dictations. Noise rather than silence, so the whole network actually runs.
-        for secs in [1.5f32, 5.0, 11.0] {
-            let n = (recorder::STT_RATE as f32 * secs) as usize;
-            let noise: Vec<f32> = (0..n).map(|i| ((i * 7919 % 2000) as f32 - 1000.0) / 40_000.0).collect();
-            let _ = session.run(&noise, &RunOptions::default());
+        // On the CPU there is nothing to prepare, so the passes would only delay the load.
+        if on_gpu && want_gpu {
+            for secs in [1.5f32, 5.0, 11.0] {
+                let n = (recorder::STT_RATE as f32 * secs) as usize;
+                let noise: Vec<f32> = (0..n).map(|i| ((i * 7919 % 2000) as f32 - 1000.0) / 40_000.0).collect();
+                let _ = session.run(&noise, &RunOptions::default());
+            }
         }
         Ok(Loaded {
             kind,
@@ -251,7 +260,13 @@ fn load_transcribe(kind: SttModel, path: &std::path::Path, n_threads: i32, want_
             requested_gpu: want_gpu,
         })
     };
-    load().map_err(|e| format!("Could not load the speech model: {e}"))
+    load().map_err(|e| {
+        // The file itself is unreadable (damaged download): remove it so a retry fetches it again.
+        if matches!(e, transcribe_cpp::Error::ModelLoad(_)) {
+            hub::evict_if_damaged(path);
+        }
+        format!("Could not load the speech model: {e}")
+    })
 }
 
 /// Load the transcribe.cpp backend modules (Vulkan GPU, CPU variants) that sit next to the exe.
@@ -278,9 +293,13 @@ struct Worker {
     notify: SttNotify,
     loaded: Option<Loaded>,
     vad: Option<Vad>,
-    /// Set after a GPU failure: stay on the CPU until the next restart or settings change.
-    force_cpu: bool,
+    /// Set after a GPU failure with this model: stay on the CPU until the next restart, retry or
+    /// settings change (`Cmd::Unload`, or switching to another model).
+    force_cpu: Option<SttModel>,
 }
+
+/// Set when the model refuses the small preview window, so it is not tried again.
+static QUICK_REJECTED: AtomicBool = AtomicBool::new(false);
 
 impl Worker {
     fn set_state(&self, state: SttState) {
@@ -291,7 +310,9 @@ impl Worker {
     fn run(mut self) {
         loop {
             let unload_after = self.cfg.read().stt_unload_minutes;
-            let cmd = if self.loaded.is_some() && unload_after > 0 {
+            // Whistle cannot be unloaded (the engine keeps it until exit), so it never times out.
+            let unloadable = self.loaded.as_ref().is_some_and(|l| !matches!(l.engine, Engine::Whistle(_)));
+            let cmd = if unloadable && unload_after > 0 {
                 self.rx.recv_timeout(Duration::from_secs(unload_after as u64 * 60))
             } else {
                 self.rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
@@ -304,25 +325,47 @@ impl Worker {
                 }
                 Err(RecvTimeoutError::Disconnected) => return,
             };
-            match cmd {
-                Cmd::Quit => return,
-                Cmd::Unload => self.unload(),
-                Cmd::Preload => {
-                    if self.cfg.read().stt_enabled {
-                        let _ = self.ensure_loaded();
-                    } else {
-                        self.unload();
-                        self.set_state(SttState::Disabled);
-                    }
+            if matches!(cmd, Cmd::Quit) {
+                return;
+            }
+            // A panic (in the model code, say) must not leave the dictation waiting forever.
+            let transcription = if let Cmd::Transcribe { id, .. } = &cmd { Some(*id) } else { None };
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.handle(cmd))).is_err() {
+                log::error!("the speech recognition worker panicked");
+                (self.loaded, self.vad) = (None, None);
+                self.set_state(SttState::Error("Speech recognition failed unexpectedly - try Retry".into()));
+                if let Some(id) = transcription {
+                    (self.notify)(SttEvent::Finished(id, Outcome::Failed("internal error".into())));
                 }
-                Cmd::Live(audio) => self.live(audio),
-                Cmd::Transcribe { pcm, id, reply } => self.handle_transcribe(pcm, id, reply),
             }
         }
     }
 
+    fn handle(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::Quit => {}
+            Cmd::Unload => {
+                // Sent on a retry and when the GPU setting changes: give the GPU another chance.
+                self.force_cpu = None;
+                self.unload();
+            }
+            Cmd::Preload => {
+                if self.cfg.read().stt_enabled {
+                    let _ = self.ensure_loaded();
+                } else {
+                    self.unload(); // also reports `Disabled`
+                }
+            }
+            Cmd::Live(audio) => self.live(audio),
+            Cmd::Transcribe { pcm, id, submit, reply } => self.handle_transcribe(pcm, id, submit, reply),
+        }
+    }
+
     fn unload(&mut self) {
-        if self.loaded.take().is_some() || self.vad.take().is_some() {
+        let (model, vad) = (self.loaded.take(), self.vad.take());
+        if model.as_ref().is_some_and(|l| matches!(l.engine, Engine::Whistle(_))) {
+            log::info!("speech model released (the Whistle engine keeps it in memory until exit)");
+        } else if model.is_some() || vad.is_some() {
             log::info!("speech model unloaded");
         }
         let enabled = self.cfg.read().stt_enabled;
@@ -334,7 +377,10 @@ impl Worker {
             let c = self.cfg.read();
             (c.stt_model, c.thread_count() as i32, c.use_gpu)
         };
-        let want_gpu = want_gpu && !self.force_cpu;
+        if self.force_cpu.is_some_and(|k| k != kind) {
+            self.force_cpu = None; // the model was changed in the settings
+        }
+        let want_gpu = want_gpu && self.force_cpu != Some(kind);
         if self.loaded.as_ref().map(|l| (l.kind, l.requested_gpu)) == Some((kind, want_gpu)) {
             if self.status.lock().state != SttState::Ready {
                 self.set_state(SttState::Ready);
@@ -397,7 +443,17 @@ impl Worker {
         if self.vad.is_some() {
             return Ok(());
         }
-        let path = self.fetch(VAD_REPO, VAD_FILE).map_err(|e| format!("VAD download failed: {e:#}"))?;
+        // The VAD may be fetched in the middle of a load or transcription: show `Downloading` only
+        // while it lasts.
+        let prev = self.status.lock().state.clone();
+        let path = self.fetch(VAD_REPO, VAD_FILE);
+        if self.status.lock().state != prev {
+            self.set_state(prev);
+        }
+        let path = path.map_err(|e| {
+            *self.download.lock() = Progress::default();
+            format!("VAD download failed: {e:#}")
+        })?;
         self.vad = Some(Vad::load(&path).map_err(|e| format!("VAD load failed: {e:#}"))?);
         Ok(())
     }
@@ -424,25 +480,43 @@ impl Worker {
             Engine::Transcribe { model, session } => {
                 let options = transcribe_options(kind, model, &cfg);
                 if model.capabilities().supports_streaming {
-                    let mut stream = match session.stream(&options, &StreamOptions::default()) {
-                        Ok(s) => s,
-                        Err(e) => return log::warn!("live transcript unavailable: {e}"),
+                    // Parakeet's default window waits for 1 s of audio and 1 s of lookahead, so the text
+                    // trails the speaker by about two seconds. The preview takes the smallest steps the
+                    // model offers (80 ms frames; its menu has 1, 2, 7 and 13 for the chunk): it is only
+                    // a preview, the final text comes from the whole recording.
+                    let quick = StreamOptions {
+                        family: (kind == SttModel::ParakeetUnified && !QUICK_REJECTED.load(Ordering::Relaxed)).then(|| {
+                            StreamExtension::ParakeetBuffered(ParakeetBufferedStreamOptions {
+                                left_ms: None,
+                                chunk_ms: Some(160),
+                                right_ms: Some(160),
+                            })
+                        }),
+                        ..StreamOptions::default()
                     };
-                    for piece in audio.iter() {
-                        if let Err(e) = stream.feed(&piece) {
+                    let mut stream = match session.stream(&options, &quick) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            // Not this recording's preview, but the next ones use the default window.
+                            QUICK_REJECTED.store(true, Ordering::Relaxed);
+                            return log::warn!("live transcript unavailable ({e}); using the default window from now on");
+                        }
+                    };
+                    while let Some(pcm) = next_live(&audio) {
+                        if let Err(e) = stream.feed(&pcm) {
                             return log::warn!("live transcript stopped: {e}");
                         }
                         show(&stream.text().display());
                     }
                     // Dropping the stream abandons it: the final text comes from the whole recording.
                 } else {
-                    // No streaming support: transcribe the latest audio again about once a second.
+                    // No streaming support: transcribe the latest audio again every quarter second or
+                    // so (a slower pass simply delays the next one).
                     let window = kind.max_chunk_secs() * recorder::STT_RATE as usize;
                     let (mut pcm, mut last) = (Vec::new(), Instant::now());
-                    for piece in audio.iter() {
+                    while let Some(piece) = next_live(&audio) {
                         pcm.extend(piece);
-                        pcm.extend(audio.try_iter().flatten()); // catch up after a slow run
-                        if last.elapsed() < Duration::from_secs(1) {
+                        if last.elapsed() < Duration::from_millis(250) {
                             continue;
                         }
                         last = Instant::now();
@@ -456,7 +530,7 @@ impl Worker {
         }
     }
 
-    fn handle_transcribe(&mut self, pcm: Vec<f32>, id: u64, reply: Option<Sender<Result<String, String>>>) {
+    fn handle_transcribe(&mut self, pcm: Vec<f32>, id: u64, submit: bool, reply: Option<Sender<Result<String, String>>>) {
         let mut outcome = self.transcribe(pcm, id);
         if let Some(r) = reply {
             // Command-line use: hand the text back instead of inserting it.
@@ -470,13 +544,15 @@ impl Worker {
         }
         if let Outcome::Inserted(text) = &outcome {
             let cfg = self.cfg.read().clone();
+            let current = self.current.clone();
+            let cancelled = move || current.load(Ordering::SeqCst) != id;
             if self.current.load(Ordering::SeqCst) != id {
                 outcome = Outcome::Cancelled;
-            } else if let Err(e) = deliver(text, &cfg) {
+            } else if let Err(e) = deliver(text, &cfg, submit, &cancelled) {
                 outcome = Outcome::Failed(format!("Could not insert the text: {e}"));
             }
         }
-        (self.notify)(SttEvent::Finished(outcome));
+        (self.notify)(SttEvent::Finished(id, outcome));
     }
 
     fn transcribe(&mut self, mut pcm: Vec<f32>, id: u64) -> Outcome {
@@ -518,7 +594,7 @@ impl Worker {
                 Err(e) if on_gpu => {
                     // The GPU failed (driver reset, out of memory, ...): carry on with the CPU.
                     log::warn!("GPU transcription failed ({e}); switching to the CPU");
-                    self.force_cpu = true;
+                    self.force_cpu = self.loaded.as_ref().map(|l| l.kind);
                     self.loaded = None;
                     if let Err(e) = self.ensure_loaded() {
                         return Outcome::Failed(e);
@@ -535,7 +611,8 @@ impl Worker {
         }
         let text = pieces.join(" ");
         let millis = t0.elapsed().as_millis() as u32;
-        log::info!("transcribed {audio_secs:.1}s of audio in {millis} ms: {text:?}");
+        // Not the text itself: the log is kept even when the history is off.
+        log::info!("transcribed {audio_secs:.1}s of audio in {millis} ms ({} characters)", text.chars().count());
         {
             let mut st = self.status.lock();
             st.last = Some(SttMetrics { audio_secs, millis });
@@ -557,7 +634,9 @@ impl Worker {
 /// step, so a pass gets slower as the stream grows (and a stream holds at most 30 s). Start a new
 /// stream at a pause once it is a few seconds long, and keep what was said so far.
 fn live_whistle(w: Whistle, cfg: &Config, audio: &LiveAudio, show: &mut impl FnMut(&str)) {
-    const STEP: usize = recorder::STT_RATE as usize / 2;
+    // A short step keeps the text close behind the speaker; a pass that takes longer than a step just
+    // makes `next_live` hand over everything that arrived meanwhile.
+    const STEP: usize = recorder::STT_RATE as usize / 8;
     /// Restart at the next pause after this many seconds, or regardless after `RESTART_MAX_SECS`.
     const RESTART_SECS: f32 = 8.0;
     const RESTART_MAX_SECS: f32 = 14.0;
@@ -566,9 +645,8 @@ fn live_whistle(w: Whistle, cfg: &Config, audio: &LiveAudio, show: &mut impl FnM
     let (language, words) = (whistle_language(cfg), custom_words(cfg));
     let (mut earlier, mut stream, mut buffered) = (String::new(), w.stream(language, &words), Vec::new());
     let join = |earlier: &str, now: &str| [earlier, now].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join(" ");
-    for piece in audio.iter() {
+    while let Some(piece) = next_live(audio) {
         buffered.extend(piece);
-        buffered.extend(audio.try_iter().flatten()); // catch up after a slow pass
         if buffered.len() < STEP {
             continue;
         }
@@ -589,17 +667,36 @@ fn live_whistle(w: Whistle, cfg: &Config, audio: &LiveAudio, show: &mut impl FnM
     }
 }
 
+/// The live audio that has arrived since the last call (waiting for some if there is none yet).
+/// `None` once the recording has stopped: a preview pass over the last bit of audio would only
+/// delay the real transcription, which takes the whole recording anyway. This also skips the
+/// preview entirely when the model finished loading only after the recording was over.
+fn next_live(audio: &LiveAudio) -> Option<Vec<f32>> {
+    let mut pcm = audio.recv().ok()?;
+    loop {
+        match audio.try_recv() {
+            Ok(piece) => pcm.extend(piece), // catch up after a slow pass
+            Err(mpsc::TryRecvError::Empty) => return Some(pcm),
+            Err(mpsc::TryRecvError::Disconnected) => return None,
+        }
+    }
+}
+
 /// Cut `pcm` into pieces of at most `max` samples, at the quietest moment of the last 3 s of each
-/// piece so that a cut rarely lands inside a word.
+/// piece so that a cut rarely lands inside a word. No piece after the first is shorter than
+/// `MIN_PIECE` (a sliver of audio transcribes badly), as long as `max` is a few seconds.
 fn split_at_quiet(pcm: &[f32], max: usize) -> Vec<&[f32]> {
     const WINDOW: usize = recorder::STT_RATE as usize / 50; // 20 ms
     const SEARCH: usize = 3 * recorder::STT_RATE as usize;
+    const MIN_PIECE: usize = recorder::STT_RATE as usize / 2;
     let mut pieces = Vec::new();
     let mut rest = pcm;
     while rest.len() > max {
+        // Cut early enough to leave at least `MIN_PIECE` for what follows.
+        let end = max.min(rest.len().saturating_sub(MIN_PIECE)).max(WINDOW);
         let energy = |at: usize| rest[at..at + WINDOW].iter().map(|s| s * s).sum::<f32>();
-        let quietest = (max.saturating_sub(SEARCH)..max - WINDOW).step_by(WINDOW).min_by(|&a, &b| energy(a).total_cmp(&energy(b)));
-        let (piece, tail) = rest.split_at(quietest.map_or(max, |at| at + WINDOW / 2));
+        let quietest = (end.saturating_sub(SEARCH)..end - WINDOW).step_by(WINDOW).min_by(|&a, &b| energy(a).total_cmp(&energy(b)));
+        let (piece, tail) = rest.split_at(quietest.map_or(end, |at| at + WINDOW / 2));
         pieces.push(piece);
         rest = tail;
     }
@@ -609,10 +706,13 @@ fn split_at_quiet(pcm: &[f32], max: usize) -> Vec<&[f32]> {
 
 /// Insert a finished transcript and record it in the history. Runs on the worker side of the
 /// app (never on the UI thread) because inserting waits for key releases and clipboard timing.
-pub fn deliver(text: &str, cfg: &Config) -> Result<(), String> {
+pub fn deliver(text: &str, cfg: &Config, submit: bool, cancelled: &(dyn Fn() -> bool + Sync)) -> Result<(), String> {
+    if cancelled() {
+        return Err("cancelled".into());
+    }
     history::add(text, cfg.history_limit);
     // Test hook: run the whole pipeline but do not send keystrokes to the focused application.
-    if std::env::var_os("SONORANT_TEST_NO_PASTE").is_some() {
+    if cfg!(feature = "test-hooks") && std::env::var_os("SONORANT_TEST_NO_PASTE").is_some() {
         return Ok(());
     }
     platform::insert(
@@ -620,8 +720,9 @@ pub fn deliver(text: &str, cfg: &Config) -> Result<(), String> {
         &InsertOptions {
             method: cfg.paste_method,
             keep_clipboard: cfg.paste_keep_clipboard,
-            auto_submit: cfg.auto_submit,
-            trailing_space: cfg.trailing_space,
+            auto_submit: cfg.auto_submit || submit,
+            trailing_space: cfg.trailing_space && !submit,
+            cancelled,
         },
     )
     .map_err(|e| format!("{e:#}"))
@@ -644,5 +745,23 @@ mod tests {
         let first_end = pieces[0].len();
         assert!((27 * rate..27 * rate + rate / 2).contains(&first_end), "cut at {first_end}");
         assert_eq!(split_at_quiet(&pcm[..rate], 29 * rate).len(), 1);
+    }
+
+    #[test]
+    fn no_sliver_at_the_end() {
+        let rate = recorder::STT_RATE as usize;
+        let max = 29 * rate;
+        for extra in [1, rate / 100, rate / 4, rate / 2, rate] {
+            // Steady "speech", and the same with silence right at the end of the first piece.
+            let speech: Vec<f32> = (0..max + extra).map(|i| ((i % 50) as f32 - 25.0) / 100.0).collect();
+            let mut pause = speech.clone();
+            pause[max - rate / 10..max].fill(0.0);
+            for pcm in [&speech, &pause] {
+                let pieces = split_at_quiet(pcm, max);
+                assert_eq!(pieces.len(), 2);
+                assert_eq!(pieces.iter().map(|p| p.len()).sum::<usize>(), pcm.len());
+                assert!(pieces.iter().all(|p| (rate / 2..=max).contains(&p.len())), "{extra}: {:?}", pieces.iter().map(|p| p.len()).collect::<Vec<_>>());
+            }
+        }
     }
 }

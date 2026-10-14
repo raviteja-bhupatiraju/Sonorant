@@ -6,43 +6,22 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VK_CONTROL, VK_INSERT};
 
-use super::win::{foreground_class, is_terminal, key_event, send_input, wait_for_modifier_release};
+use super::clipboard;
+use super::win::{key_event, send_input, wait_for_modifier_release};
 
-const VK_C: u16 = 0x43;
-
+/// Ctrl+Insert copies in every Windows toolkit, and in terminals (where Ctrl+C would interrupt
+/// the running program when nothing is selected) it is the copy shortcut. It is used everywhere,
+/// so that a terminal Sonorant does not know about cannot be interrupted.
 fn send_copy_shortcut() {
-    // In consoles / terminals Ctrl+C means "interrupt", so use Ctrl+Insert there.
-    let (key, extra) = if is_terminal(&foreground_class()) { (VK_INSERT, KEYEVENTF_EXTENDEDKEY) } else { (VK_C, 0) };
-    send_input(&[
+    let sent = send_input(&[
         key_event(VK_CONTROL, 0),
-        key_event(key, extra),
-        key_event(key, extra | KEYEVENTF_KEYUP),
+        key_event(VK_INSERT, KEYEVENTF_EXTENDEDKEY),
+        key_event(VK_INSERT, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP),
         key_event(VK_CONTROL, KEYEVENTF_KEYUP),
     ]);
-}
-
-pub(crate) enum Saved {
-    Text(String),
-    Image(arboard::ImageData<'static>),
-    Empty,
-}
-
-pub(crate) fn save_clipboard(clipboard: &mut arboard::Clipboard) -> Saved {
-    if let Ok(t) = clipboard.get_text() {
-        Saved::Text(t)
-    } else if let Ok(img) = clipboard.get_image() {
-        Saved::Image(img.to_owned_img())
-    } else {
-        Saved::Empty
+    if let Err(e) = sent {
+        log::warn!("copy shortcut: {e:#}");
     }
-}
-
-pub(crate) fn restore_clipboard(clipboard: &mut arboard::Clipboard, saved: Saved) {
-    let _ = match saved {
-        Saved::Text(t) => clipboard.set_text(t),
-        Saved::Image(img) => clipboard.set_image(img),
-        Saved::Empty => clipboard.clear(),
-    };
 }
 
 /// Call `f` up to `tries` times, 10 ms apart, until it succeeds.
@@ -81,7 +60,12 @@ pub fn selected_text(restore: bool, clipboard_fallback: bool) -> Option<(String,
     wait_for_modifier_release(Duration::from_millis(1500));
 
     let mut clipboard = open_clipboard()?;
-    let saved = save_clipboard(&mut clipboard);
+    let saved = restore.then(clipboard::save);
+    if matches!(saved, Some(clipboard::Saved::Failed)) {
+        // The copy shortcut would overwrite a clipboard that cannot be backed up.
+        log::warn!("selection: the clipboard cannot be saved, so the selection is not read");
+        return None;
+    }
 
     let before = unsafe { GetClipboardSequenceNumber() };
     let t0 = Instant::now();
@@ -101,15 +85,15 @@ pub fn selected_text(restore: bool, clipboard_fallback: bool) -> Option<(String,
         // Give the source app a moment to finish writing all formats.
         std::thread::sleep(Duration::from_millis(15));
         let text = retry(10, || clipboard.get_text());
-        if restore {
-            restore_clipboard(&mut clipboard, saved);
+        if let Some(saved) = saved {
+            clipboard::restore(saved);
         }
         text
+    } else if clipboard_fallback {
+        // Nothing was copied, so the clipboard still holds what it held before.
+        clipboard.get_text().ok()
     } else {
-        match saved {
-            Saved::Text(t) if clipboard_fallback => Some(t),
-            _ => None,
-        }
+        None
     };
     result.filter(|t| has_words(t)).map(|t| (t, t0))
 }

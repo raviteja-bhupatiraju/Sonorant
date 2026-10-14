@@ -107,7 +107,7 @@ pub fn paste() -> Result<()> {
         if unsafe { GetForegroundWindow() } != hwnd {
             bail!("lost the focus before testing {name}; stopping");
         }
-        let opts = InsertOptions { method, keep_clipboard: keep, auto_submit: false, trailing_space: true };
+        let opts = InsertOptions { method, keep_clipboard: keep, auto_submit: false, trailing_space: true, cancelled: &|| false };
         let t = text.to_owned();
         let worker = std::thread::spawn(move || platform::insert(&t, &opts));
         while !worker.is_finished() {
@@ -168,10 +168,12 @@ pub fn overlay() -> Result<()> {
 }
 
 pub fn mic() -> Result<()> {
-    let rec = crate::stt::recorder::Recorder::spawn();
-    rec.start("").map_err(|e| anyhow::anyhow!(e))?;
+    let rec = crate::stt::recorder::Recorder::spawn(std::sync::Arc::new(|| println!("the microphone was lost")));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let _live = rec.start("", Box::new(move |r| drop(tx.send(r))));
+    rx.recv()?.map_err(|e| anyhow::anyhow!(e))?;
     std::thread::sleep(Duration::from_secs(1));
-    let pcm = rec.stop();
+    let pcm = rec.stop_blocking();
     let rms = (pcm.iter().map(|x| x * x).sum::<f32>() / pcm.len().max(1) as f32).sqrt();
     let peak = pcm.iter().fold(0.0f32, |m, x| m.max(x.abs()));
     println!("captured {} samples at 16 kHz ({:.2} s), rms {:.4}, peak {:.3}", pcm.len(), pcm.len() as f32 / 16_000.0, rms, peak);

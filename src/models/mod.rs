@@ -8,6 +8,7 @@ use anyhow::Result;
 use parking_lot::Mutex;
 
 pub mod hub;
+mod pins;
 
 use crate::config::ModelVariant;
 
@@ -76,5 +77,27 @@ pub fn remove_legacy_models() {
             Ok(()) => log::info!("removed legacy model folder {}", old.display()),
             Err(e) => log::warn!("could not remove legacy model folder: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SttModel;
+
+    /// Every file Sonorant downloads must have a pin (see `pins`).
+    #[test]
+    fn all_downloads_are_pinned() {
+        let pinned = |repo: &str, file: &str| pins::PINS.iter().any(|p| p.0 == repo && p.1 == file);
+        for v in ModelVariant::ALL {
+            assert!(pinned(KOKORO_REPO, kokoro_model_file(v)), "{v:?}");
+        }
+        for name in US_VOICES {
+            assert!(pinned(KOKORO_REPO, &voice_file(name)), "{name}");
+        }
+        for m in SttModel::ALL {
+            assert!(pinned(m.repo(), m.file()), "{m:?}");
+        }
+        assert!(pinned("onnx-community/silero-vad", "onnx/model.onnx"));
     }
 }

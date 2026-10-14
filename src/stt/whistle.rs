@@ -3,11 +3,11 @@
 //! `libneedle3.so`, fetched by `scripts/fetch-needle.*`) that is loaded at run time, like ONNX Runtime.
 //!
 //! The engine keeps one process-global model and is not thread-safe, so every call is serialised
-//! here. Audio is 16 kHz mono `f32`, at most 30 s per call.
+//! here. Audio is 16 kHz mono `f32`, at most 30 s per call. Once loaded, the model stays in memory
+//! until the process exits (the engine has no way to unload it).
 
 use std::ffi::{c_char, c_int, c_uchar, c_ulonglong, CStr, CString};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Context, Result};
 use libloading::Library;
@@ -66,8 +66,7 @@ impl Api {
         if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
             candidates.push(dir.join(LIB));
         }
-        candidates.push(crate::config::data_dir().join(LIB));
-        let path = candidates
+            let path = candidates
             .into_iter()
             .find(|p| p.is_file())
             .ok_or_else(|| anyhow!("{LIB} (the Whistle engine) not found next to Sonorant (see README)"))?;
@@ -111,9 +110,17 @@ impl Api {
     }
 }
 
+/// The engine library, opened on first use. Only success is kept, so a retry after installing a
+/// missing library works without a restart.
 fn api() -> Result<&'static Api> {
-    static API: OnceLock<Result<Api, String>> = OnceLock::new();
-    API.get_or_init(|| Api::open().map_err(|e| format!("{e:#}"))).as_ref().map_err(|e| anyhow!(e.clone()))
+    static API: Mutex<Option<&'static Api>> = Mutex::new(None);
+    let mut api = API.lock();
+    if let Some(a) = *api {
+        return Ok(a);
+    }
+    let a: &'static Api = Box::leak(Box::new(Api::open()?));
+    *api = Some(a);
+    Ok(a)
 }
 
 /// Every engine call takes this: the model and its streaming state are process-global.
@@ -157,18 +164,26 @@ pub struct Whistle {
 }
 
 impl Whistle {
-    /// Load the engine and the model file (a no-op when the model is already loaded).
+    /// Load the engine and the model file (a no-op when the model is already loaded: it is reused,
+    /// never read twice). A file the engine rejects is removed from the cache, so a retry
+    /// downloads it again.
     pub fn load(model: &Path) -> Result<Self> {
         let api = api()?;
         let _calls = CALLS.lock();
         // SAFETY: plain calls into the engine, serialised by CALLS.
         if unsafe { (api.models)() } & SPEECH == 0 {
             let bytes = std::fs::read(model).with_context(|| format!("read {}", model.display()))?;
-            // The engine may keep pointing into these bytes, and the model stays loaded for the
-            // life of the process (17 MB), so never free them.
-            let bytes: &'static [u8] = Vec::leak(bytes);
-            api.check(unsafe { (api.load)(bytes.as_ptr(), bytes.len() as c_ulonglong) })?;
+            let rc = unsafe { (api.load)(bytes.as_ptr(), bytes.len() as c_ulonglong) };
+            if let Err(e) = api.check(rc) {
+                // Rejected: the engine keeps nothing of a failed load, so the bytes are freed.
+                crate::models::hub::evict_if_damaged(model);
+                return Err(e);
+            }
+            // Accepted: the engine may keep pointing into these bytes, and the model stays loaded
+            // for the life of the process (17 MB), so never free them.
+            Vec::leak(bytes);
             if unsafe { (api.models)() } & SPEECH == 0 {
+                crate::models::hub::evict_if_damaged(model);
                 bail!("{} is not a Whistle speech model", model.display());
             }
         }
@@ -196,7 +211,7 @@ impl Whistle {
         };
         let tokens = api.check(rc)?;
         let reply = parse(&out)?;
-        log::debug!("whistle: {tokens} tokens, first after {:.0} ms, then {:.0} tokens/s", reply.ttft_ms, reply.decode_tps);
+        log::info!("whistle: {tokens} tokens, first after {:.0} ms, then {:.0} tokens/s", reply.ttft_ms, reply.decode_tps);
         Ok(reply.text.trim().to_owned())
     }
 

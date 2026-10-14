@@ -2,7 +2,11 @@
 ; after `cargo build --release`). The models are downloaded on first use.
 
 #define AppName    "Sonorant"
-#define AppVersion "0.1.0"
+; build.ps1 passes the version from Cargo.toml (ISCC /DAppVersion=x.y.z); this default is for
+; compiling the script by hand.
+#ifndef AppVersion
+  #define AppVersion "0.2.0"
+#endif
 #define AppExe     "sonorant.exe"
 #define BuildDir   "..\target\release"
 
@@ -38,7 +42,17 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; Flags: unchecked
-Name: "startup"; Description: "Start {#AppName} when I sign in"; Flags: unchecked
+; Per-user installs only: an all-users install runs elevated, so HKCU would be the administrator's
+; registry rather than the signed-in user's. Each user can still turn it on in the app's settings.
+Name: "startup"; Description: "Start {#AppName} when I sign in"; Flags: unchecked; Check: not IsAdminInstallMode
+
+[InstallDelete]
+; The speech engines' DLLs are matched by wildcard below; remove the old ones first so a backend
+; module that a newer version renamed or dropped is not left behind (and loaded) after an upgrade.
+Type: files; Name: "{app}\ggml*.dll"
+Type: files; Name: "{app}\transcribe*.dll"
+Type: files; Name: "{app}\onnxruntime*.dll"
+Type: files; Name: "{app}\libneedle*.dll"
 
 [Files]
 Source: "{#BuildDir}\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
@@ -68,22 +82,82 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 Filename: "{app}\{#AppExe}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
 
 [Code]
-procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+const
+  RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
+
+// Stop Sonorant if it is still running from this installation (normally the AppMutex prompt has
+// already asked the user to close it). Other copies, such as development builds, are left alone.
+procedure StopInstalledApp;
 var
+  Exe, Params: String;
   ResultCode: Integer;
 begin
+  Exe := ExpandConstant('{app}\{#AppExe}');
+  StringChangeEx(Exe, '''', '''''', True); // quote for a PowerShell single-quoted string
+  Params := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' +
+    'Get-Process -Name ''' + ChangeFileExt('{#AppExe}', '') + ''' -ErrorAction SilentlyContinue | ' +
+    'Where-Object { $_.Path -eq ''' + Exe + ''' } | Stop-Process -Force; Start-Sleep -Milliseconds 500"';
+  Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Params, '', SW_HIDE,
+    ewWaitUntilTerminated, ResultCode);
+end;
+
+// The Hugging Face cache, resolved as the app does (src/models/hub.rs): HF_HUB_CACHE, else
+// HF_HOME\hub, else XDG_CACHE_HOME\huggingface\hub, else %USERPROFILE%\.cache\huggingface\hub.
+// Empty if it cannot be determined.
+function HubCacheDir: String;
+begin
+  Result := GetEnv('HF_HUB_CACHE');
+  if Result = '' then
+    Result := GetEnv('HUGGINGFACE_HUB_CACHE');
+  if (Result = '') and (GetEnv('HF_HOME') <> '') then
+    Result := AddBackslash(GetEnv('HF_HOME')) + 'hub';
+  if (Result = '') and (GetEnv('XDG_CACHE_HOME') <> '') then
+    Result := AddBackslash(GetEnv('XDG_CACHE_HOME')) + 'huggingface\hub';
+  if (Result = '') and (GetEnv('USERPROFILE') <> '') then
+    Result := AddBackslash(GetEnv('USERPROFILE')) + '.cache\huggingface\hub';
+end;
+
+// Delete one model repository (models--<org>--<name>) from the Hugging Face cache.
+procedure DeleteCachedRepo(const Cache, Repo: String);
+var
+  Name: String;
+begin
+  Name := 'models--' + Repo;
+  StringChangeEx(Name, '/', '--', True);
+  DelTree(AddBackslash(Cache) + Name, True, True, True);
+  DelTree(AddBackslash(Cache) + '.locks\' + Name, True, True, True);
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Cache: String;
+begin
   if CurUninstallStep = usUninstall then
-    Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#AppExe}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
+    StopInstalledApp
   else if CurUninstallStep = usPostUninstall then
   begin
-    // Remove autostart even if it was enabled from inside the app.
-    RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#AppName}');
-    // Downloaded models (~330 MB), settings and log: keep unless the user agrees.
-    if SuppressibleMsgBox('Also delete Sonorant settings and downloaded voice models?', mbConfirmation,
-         MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES then
+    // Remove autostart even if it was enabled from inside the app. Only the current user's value
+    // can be reached (for an all-users uninstall, the user who runs it).
+    RegDeleteValue(HKCU, RunKey, '{#AppName}');
+    // Settings, log and downloaded models: keep unless the user agrees. The models live in the
+    // Hugging Face cache, which other programs may share: only Sonorant's model folders go.
+    Cache := HubCacheDir;
+    if SuppressibleMsgBox('Also delete Sonorant''s settings and the speech models it downloaded?' + #13#10#13#10 +
+         'The models are stored in the Hugging Face cache (' + Cache + '), which other programs may share. ' +
+         'Only the folders of the models Sonorant uses are removed; another program that uses the same ' +
+         'models would download them again.', mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES then
     begin
       DelTree(ExpandConstant('{localappdata}\{#AppName}'), True, True, True);
       DelTree(ExpandConstant('{userappdata}\{#AppName}'), True, True, True);
+      if Cache <> '' then
+      begin
+        // Keep in sync with the repositories in src/models/mod.rs, src/stt and src/config.rs.
+        DeleteCachedRepo(Cache, 'onnx-community/Kokoro-82M-v1.0-ONNX');
+        DeleteCachedRepo(Cache, 'onnx-community/silero-vad');
+        DeleteCachedRepo(Cache, 'Cactus-Compute/whistle');
+        DeleteCachedRepo(Cache, 'handy-computer/parakeet-unified-en-0.6b-gguf');
+        DeleteCachedRepo(Cache, 'handy-computer/canary-180m-flash-gguf');
+      end;
     end;
   end;
 end;

@@ -9,7 +9,7 @@ use std::process::Command as Process;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use arboard::{Clipboard, GetExtLinux, LinuxClipboardKind};
 use ashpd::desktop::remote_desktop::{DeviceType, KeyState, RemoteDesktop, SelectDevicesOptions};
 use ashpd::desktop::{PersistMode, Session};
@@ -89,41 +89,92 @@ fn token_path() -> std::path::PathBuf {
     crate::config::data_dir().join("remote-desktop.token")
 }
 
+/// Whether the compositor offers the virtual-keyboard protocol that `wtype` types through (wlroots
+/// compositors do; GNOME and KDE do not, so `wtype` cannot stand in for the portal there).
+fn virtual_keyboard_available() -> bool {
+    use smithay_client_toolkit::reexports::client::globals::{registry_queue_init, GlobalListContents};
+    use smithay_client_toolkit::reexports::client::protocol::wl_registry::{self, WlRegistry};
+    use smithay_client_toolkit::reexports::client::{Connection, Dispatch, QueueHandle};
+
+    struct Probe;
+    impl Dispatch<WlRegistry, GlobalListContents> for Probe {
+        fn event(_: &mut Self, _: &WlRegistry, _: wl_registry::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
+    }
+    let Ok(conn) = Connection::connect_to_env() else { return false };
+    let Ok((globals, _queue)) = registry_queue_init::<Probe>(&conn) else { return false };
+    globals.contents().with_list(|list| list.iter().any(|g| g.interface == "zwp_virtual_keyboard_manager_v1"))
+}
+
+/// End a RemoteDesktop session (ashpd does not close it when dropped). Also withdraws a request
+/// still waiting on it, such as an unanswered permission dialog.
+fn close_session(session: &Session<RemoteDesktop>) {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return; // cannot wait on the runtime from inside it
+    }
+    if let Some(Err(e)) = block_on(Duration::from_secs(2), session.close()) {
+        log::debug!("closing the RemoteDesktop session: {e}");
+    }
+}
+
+impl Drop for Keyboard {
+    fn drop(&mut self) {
+        if let Keyboard::Portal { session, .. } = self {
+            close_session(session);
+        }
+    }
+}
+
 impl Keyboard {
     fn connect() -> Result<Self> {
         if super::use_x11() {
             return Ok(Keyboard::X11(Box::new(super::x11::Keys::connect()?)));
         }
-        let portal = block_on(Duration::from_secs(120), async {
+        let why = match Self::connect_portal() {
+            Ok(k) => return Ok(k),
+            Err(e) => format!("{e:#}"),
+        };
+        if !virtual_keyboard_available() {
+            bail!("cannot send keystrokes: the desktop's RemoteDesktop portal is unavailable ({why})");
+        }
+        log::warn!("RemoteDesktop portal unavailable ({why}); trying wtype");
+        if Process::new("wtype").arg("--help").output().is_ok() {
+            Ok(Keyboard::Wtype)
+        } else {
+            bail!("cannot send keystrokes: the desktop's RemoteDesktop portal is unavailable ({why}) and wtype is not installed")
+        }
+    }
+
+    fn connect_portal() -> Result<Self> {
+        let (proxy, session) = block_on(Duration::from_secs(10), async {
             register_app().await;
             let proxy = RemoteDesktop::new().await?;
             let session = proxy.create_session(Default::default()).await?;
-            let token = std::fs::read_to_string(token_path()).ok();
+            ashpd::Result::Ok((proxy, session))
+        })
+        .context("no answer")??;
+        let token = std::fs::read_to_string(token_path()).ok();
+        // Shows the permission dialog unless the restore token is still valid: give the user time.
+        let started = block_on(Duration::from_secs(120), async {
             let options = SelectDevicesOptions::default()
                 .set_devices(ashpd::enumflags2::BitFlags::from_flag(DeviceType::Keyboard))
                 .set_persist_mode(PersistMode::ExplicitlyRevoked)
                 .set_restore_token(token.as_deref().map(str::trim));
             proxy.select_devices(&session, options).await?.response()?;
-            // Shows the permission dialog unless the restore token is still valid.
-            let started = proxy.start(&session, None, Default::default()).await?.response()?;
-            if let Some(token) = started.restore_token() {
-                let _ = std::fs::create_dir_all(crate::config::data_dir());
-                let _ = std::fs::write(token_path(), token);
-            }
-            ashpd::Result::Ok(Keyboard::Portal { proxy, session })
+            proxy.start(&session, None, Default::default()).await?.response()
         });
-        match portal {
-            Some(Ok(k)) => Ok(k),
-            other => {
-                let why = match other {
-                    Some(Err(e)) => e.to_string(),
-                    _ => "no answer".into(),
-                };
-                log::warn!("RemoteDesktop portal unavailable ({why}); trying wtype");
-                if Process::new("wtype").arg("--help").output().is_ok() {
-                    Ok(Keyboard::Wtype)
-                } else {
-                    bail!("cannot send keystrokes: the desktop's RemoteDesktop portal is unavailable ({why}) and wtype is not installed")
+        match started {
+            Some(Ok(started)) => {
+                if let Some(token) = started.restore_token() {
+                    let _ = std::fs::create_dir_all(crate::config::data_dir());
+                    let _ = std::fs::write(token_path(), token);
+                }
+                Ok(Keyboard::Portal { proxy, session })
+            }
+            failed => {
+                close_session(&session); // don't leave the session (and its dialog) behind
+                match failed {
+                    Some(Err(e)) => Err(e.into()),
+                    _ => bail!("no answer"),
                 }
             }
         }
@@ -156,19 +207,51 @@ impl Keyboard {
         }
     }
 
+    /// Send key presses (`true`) and releases through the portal, one D-Bus call each. They go in
+    /// chunks with a time limit each, so a long text is not cut off by a fixed limit; after a failure
+    /// every key that may still be down is released.
     fn keysyms(&self, events: Vec<(u32, bool)>) -> Result<()> {
         let Keyboard::Portal { proxy, session } = self else { unreachable!("only the portal sends keysyms") };
-        let sent = block_on(Duration::from_secs(10), async {
-            for (sym, down) in events {
-                let state = if down { KeyState::Pressed } else { KeyState::Released };
-                proxy.notify_keyboard_keysym(session, sym as i32, state, Default::default()).await?;
+        let send = |sym: u32, down: bool| {
+            let state = if down { KeyState::Pressed } else { KeyState::Released };
+            proxy.notify_keyboard_keysym(session, sym as i32, state, Default::default())
+        };
+        let mut down: Vec<u32> = Vec::new();
+        let mut result = Ok(());
+        for chunk in events.chunks(64) {
+            let sent = block_on(Duration::from_secs(5), async {
+                for &(sym, press) in chunk {
+                    if press {
+                        down.push(sym); // before the call: a press cut off by the time limit may still arrive
+                    }
+                    send(sym, press).await?;
+                    if !press {
+                        if let Some(i) = down.iter().rposition(|&s| s == sym) {
+                            down.remove(i);
+                        }
+                    }
+                }
+                ashpd::Result::Ok(())
+            });
+            match sent {
+                Some(Ok(())) => continue,
+                Some(Err(e)) => result = Err(e.into()),
+                None => result = Err(anyhow!("the RemoteDesktop portal did not respond")),
             }
-            ashpd::Result::Ok(())
-        });
-        match sent {
-            Some(r) => Ok(r?),
-            None => bail!("the RemoteDesktop portal did not respond"),
+            break;
         }
+        if result.is_err() && !down.is_empty() {
+            let released = block_on(Duration::from_secs(2), async {
+                for &sym in down.iter().rev() {
+                    send(sym, false).await?;
+                }
+                ashpd::Result::Ok(())
+            });
+            if !matches!(released, Some(Ok(()))) {
+                log::warn!("could not release the keys pressed before the portal failed");
+            }
+        }
+        result
     }
 }
 
@@ -209,6 +292,14 @@ pub fn prepare_insert() {
     });
 }
 
+/// Press Enter in the focused application (the "send" key pressed without any dictation).
+pub fn send_enter() -> Result<()> {
+    if super::use_x11() {
+        super::x11::wait_modifiers_released(Duration::from_millis(800));
+    }
+    send_chord(&[], RETURN)
+}
+
 /// Insert `text` into the focused application.
 pub fn insert(text: &str, opts: &InsertOptions) -> Result<()> {
     let text = if opts.trailing_space { format!("{text} ") } else { text.to_owned() };
@@ -218,36 +309,79 @@ pub fn insert(text: &str, opts: &InsertOptions) -> Result<()> {
         super::x11::wait_modifiers_released(Duration::from_millis(800));
     }
     std::thread::sleep(Duration::from_millis(80));
+    if (opts.cancelled)() {
+        anyhow::bail!("cancelled");
+    }
 
-    match opts.method {
-        PasteMethod::Typing => keyboard()?.type_text(&text)?,
+    let mut method = opts.method;
+    if method == PasteMethod::Typing {
+        let keyboard = keyboard()?;
+        if matches!(*keyboard, Keyboard::Portal { .. }) && !text.is_ascii() {
+            // The portal types keysyms, which mutter and KWin can only type when the active layout
+            // has them: characters such as é, € or curly quotes would be dropped. Paste instead.
+            log::info!("the text has non-ASCII characters, which the portal may not type: pasting it");
+            method = PasteMethod::Auto;
+        } else if let Err(e) = keyboard.type_text(&text) {
+            // The connection may have died: make the next insert reconnect. (Not retried here: a
+            // partly typed text would be typed twice.)
+            drop(keyboard);
+            *KEYBOARD.lock() = None;
+            return Err(e);
+        }
+    }
+    match method {
+        PasteMethod::Typing => {}
         PasteMethod::ClipboardOnly => {
             clipboard()?.set_text(text)?;
             return Ok(());
         }
-        method => {
-            let mut cb = clipboard()?;
-            let saved = opts.keep_clipboard.then(|| cb.get_text().ok()).flatten();
-            cb.set_text(text)?;
-            std::thread::sleep(Duration::from_millis(40));
-            let (mods, key): (&[Key], Key) = match method {
-                PasteMethod::ShiftInsert => (&[SHIFT], INSERT),
-                PasteMethod::CtrlShiftV => (&[CTRL, SHIFT], V),
-                // Terminals paste with Ctrl+Shift+V; only X11 reveals the focused application.
-                PasteMethod::Auto if super::use_x11() && super::x11::terminal_focused() => (&[CTRL, SHIFT], V),
-                _ => (&[CTRL], V),
-            };
-            send_chord(mods, key)?;
-            if let Some(saved) = saved {
-                // Give the target application time to read the clipboard before restoring it.
-                std::thread::sleep(Duration::from_millis(300));
-                cb.set_text(saved)?;
-            }
-        }
+        method => paste(text, method, opts.keep_clipboard)?,
     }
     if opts.auto_submit {
         std::thread::sleep(Duration::from_millis(60));
         send_chord(&[], RETURN)?;
+    }
+    Ok(())
+}
+
+/// What the clipboard held before a paste, to be put back afterwards.
+enum Saved {
+    Text(String),
+    Image(arboard::ImageData<'static>),
+}
+
+/// Put `text` on the clipboard and send the paste shortcut for `method`; with `keep_clipboard`, put
+/// the previous text or image back afterwards. (Other contents, such as copied files, cannot be read
+/// here and are not restored.)
+fn paste(text: String, method: PasteMethod, keep_clipboard: bool) -> Result<()> {
+    let saved = {
+        let mut cb = clipboard()?;
+        let saved = keep_clipboard.then(|| cb.get_text().map(Saved::Text).or_else(|_| cb.get_image().map(Saved::Image)).ok()).flatten();
+        cb.set_text(text.clone())?;
+        saved
+    }; // not locked while the keys go out: a first permission dialog can take minutes
+    std::thread::sleep(Duration::from_millis(40));
+    let (mods, key): (&[Key], Key) = match method {
+        PasteMethod::ShiftInsert => (&[SHIFT], INSERT),
+        PasteMethod::CtrlShiftV => (&[CTRL, SHIFT], V),
+        // Terminals paste with Ctrl+Shift+V; only X11 reveals the focused application.
+        PasteMethod::Auto if super::use_x11() && super::x11::terminal_focused() => (&[CTRL, SHIFT], V),
+        _ => (&[CTRL], V),
+    };
+    send_chord(mods, key)?;
+    if let Some(saved) = saved {
+        // Give the target application time to read the clipboard before restoring it.
+        std::thread::sleep(Duration::from_millis(300));
+        let mut cb = clipboard()?;
+        // Something copied meanwhile (by the user or another program) is not ours to replace.
+        if cb.get_text().is_ok_and(|now| now == text) {
+            match saved {
+                Saved::Text(t) => cb.set_text(t)?,
+                Saved::Image(img) => cb.set_image(img)?,
+            }
+        } else {
+            log::debug!("the clipboard changed after pasting; not restoring it");
+        }
     }
     Ok(())
 }

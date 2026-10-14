@@ -15,6 +15,7 @@ enum Act {
     Speak,
     Stop,
     Dictate,
+    DictateSubmit,
     /// Esc during a dictation.
     Cancel,
 }
@@ -44,6 +45,7 @@ impl Hotkeys {
             let cmd = match act {
                 Act::Dictate => Command::Dictate(pressed),
                 _ if !pressed => return,
+                Act::DictateSubmit => Command::DictateSubmit,
                 Act::Speak => Command::Speak,
                 Act::Stop => Command::Stop,
                 Act::Cancel => Command::Cancel,
@@ -74,11 +76,12 @@ impl Hotkeys {
         self.transient_on = false;
         self.errors = Default::default();
 
-        // Slots match `errors`: [speak, stop, dictate].
+        // Slots match `errors`: [speak, stop, dictate, dictate and send].
         let wanted = [
             Some((Act::Speak, &cfg.hotkey)),
             cfg.stop_hotkey.as_ref().map(|k| (Act::Stop, k)),
             cfg.stt_enabled.then_some((Act::Dictate, &cfg.stt_hotkey)),
+            cfg.stt_submit_hotkey.as_ref().filter(|_| cfg.stt_enabled).map(|k| (Act::DictateSubmit, k)),
         ];
         let mut used: Vec<&HotkeySpec> = Vec::new();
         for (slot, (act, spec)) in wanted.into_iter().enumerate().filter_map(|(i, w)| Some((i, w?))) {

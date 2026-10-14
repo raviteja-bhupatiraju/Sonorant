@@ -28,6 +28,8 @@ pub enum Command {
     Stop,
     /// The dictation hotkey went down (`true`) or up (`false`).
     Dictate(bool),
+    /// Stop the recording, insert the text without a trailing space and press Enter (press only).
+    DictateSubmit,
     /// Cancel the dictation in progress.
     Cancel,
     Quit,
@@ -35,7 +37,7 @@ pub enum Command {
 
 impl Command {
     /// Names accepted by `sonorant --cmd NAME`.
-    pub const NAMES: [(&'static str, Command); 9] = [
+    pub const NAMES: [(&'static str, Command); 10] = [
         ("settings", Command::Settings),
         ("speak", Command::Speak),
         ("clipboard", Command::SpeakClipboard),
@@ -44,6 +46,7 @@ impl Command {
         ("dictate", Command::Dictate(true)),
         ("dictate-press", Command::Dictate(true)),
         ("dictate-release", Command::Dictate(false)),
+        ("dictate-submit", Command::DictateSubmit),
         ("cancel", Command::Cancel),
         ("quit", Command::Quit),
     ];
@@ -62,12 +65,14 @@ impl Command {
 pub type CommandSink = Arc<dyn Fn(Command) + Send + Sync>;
 
 /// How transcribed text is put into the focused application.
-pub struct InsertOptions {
+pub struct InsertOptions<'a> {
     pub method: PasteMethod,
     pub keep_clipboard: bool,
     pub auto_submit: bool,
     pub trailing_space: bool,
+    /// Polled before keystrokes are sent: true when the user cancelled the dictation meanwhile.
+    pub cancelled: &'a (dyn Fn() -> bool + Sync),
 }
 
-/// Registration errors for the [speak, stop, dictate] hotkeys, shown in the settings dialog.
-pub type HotkeyErrors = [Option<String>; 3];
+/// Registration errors for the [speak, stop, dictate, dictate and send] hotkeys, shown in the settings dialog.
+pub type HotkeyErrors = [Option<String>; 4];

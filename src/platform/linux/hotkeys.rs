@@ -19,7 +19,7 @@ use crate::hotkey::HotkeySpec;
 use crate::platform::{Command, CommandSink, HotkeyErrors};
 
 /// Shortcut ids, by `HotkeyErrors` slot.
-const IDS: [&str; 3] = ["speak", "stop", "dictate"];
+const IDS: [&str; 4] = ["speak", "stop", "dictate", "dictate-submit"];
 
 /// One shortcut to bind: (errors slot, description, preferred trigger).
 type Wanted = (usize, &'static str, Option<String>);
@@ -44,6 +44,7 @@ impl PortalHotkeys {
             (0, "Read the selected text aloud", Some(&cfg.hotkey)),
             (1, "Stop speaking or cancel dictation", cfg.stop_hotkey.as_ref()),
             (2, "Start or stop dictation (hold for push-to-talk)", cfg.stt_enabled.then_some(&cfg.stt_hotkey)),
+            (3, "Finish dictation and press Enter", cfg.stt_submit_hotkey.as_ref().filter(|_| cfg.stt_enabled)),
         ];
         let mut used: Vec<&HotkeySpec> = Vec::new();
         let mut wanted = Vec::new();
@@ -106,7 +107,8 @@ async fn run(mut rx: mpsc::UnboundedReceiver<Vec<Wanted>>, sink: CommandSink, er
     let id_command = |id: &str, pressed: bool| match IDS.iter().position(|&i| i == id)? {
         0 => pressed.then_some(Command::Speak),
         1 => pressed.then_some(Command::Stop),
-        _ => Some(Command::Dictate(pressed)),
+        2 => Some(Command::Dictate(pressed)),
+        _ => pressed.then_some(Command::DictateSubmit),
     };
     loop {
         tokio::select! {
@@ -159,7 +161,14 @@ async fn bind(portal: &GlobalShortcuts, wanted: &[Wanted]) -> ashpd::Result<(Ses
         .iter()
         .map(|(slot, description, trigger)| NewShortcut::new(IDS[*slot], *description).preferred_trigger(trigger.as_deref()))
         .collect();
-    let response = portal.bind_shortcuts(&session, &shortcuts, None, Default::default()).await?.response()?;
+    let response = async { portal.bind_shortcuts(&session, &shortcuts, None, Default::default()).await?.response() };
+    let response = match response.await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = session.close().await; // ashpd does not close a dropped session
+            return Err(e);
+        }
+    };
     let bound = response.shortcuts().iter().map(|s| {
         log::info!("global shortcut {} -> {}", s.id(), s.trigger_description());
         s.id().to_owned()

@@ -125,8 +125,11 @@ fn main() {
     for lib in libs {
         println!("cargo:rerun-if-changed=vendor/{lib}");
         let src = PathBuf::from("vendor").join(lib);
-        if let (true, Some(dir)) = (src.is_file(), out_dir.ancestors().nth(3)) {
-            let _ = std::fs::copy(&src, dir.join(lib));
+        let Some(dir) = out_dir.ancestors().nth(3) else { continue };
+        if !src.is_file() {
+            println!("cargo:warning=vendor/{lib} is missing: run scripts/fetch-*.{} to fetch it", if windows { "ps1" } else { "sh" });
+        } else if let Err(e) = std::fs::copy(&src, dir.join(lib)) {
+            println!("cargo:warning=could not copy vendor/{lib} to {}: {e}", dir.display());
         }
     }
     if !windows {
@@ -159,6 +162,10 @@ fn main() {
     res.set("FileDescription", "Sonorant text-to-speech");
     res.set("LegalCopyright", "Copyright (c) 2026 Ravi Teja Bhupatiraju. MIT License.");
     if let Err(e) = res.compile() {
+        // A release build without its icon and version information is not shippable.
+        if std::env::var("PROFILE").as_deref() == Ok("release") {
+            panic!("could not embed the icon and version resource: {e}");
+        }
         println!("cargo:warning=could not embed icon: {e}");
     }
 }
